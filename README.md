@@ -54,3 +54,13 @@ cargo test --workspace
 ## Лицензия
 
 GNU General Public License v3.0 или новее — см. [LICENSE](LICENSE).
+
+---
+
+# Создано с ❤️
+
+🙋 **Группа в Телеграм:** [@nova_txt](https://t.me/nova_txt) — вопросы, новости,
+поддержка.
+
+☕ **[Отблагодарить](https://nova-app.eu/donate)** — если DNS-AI оказался полезным.
+Это необязательный способ сказать "спасибо".
