@@ -1,0 +1,50 @@
+[package]
+name = "dns-ai-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared logic for the DNS-AI Windows client: adapter DNS state, backup/restore, local DoH stub, IPC protocol."
+
+[features]
+default = ["stub"]
+# The tray links this crate for the IPC types alone; without "stub" it does not drag in
+# tokio, hyper and rustls for a UI that never opens a socket.
+stub = ["dep:tokio", "dep:reqwest"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+log.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# The same version the client uses, and that is the point: 0.52 pulled `windows-sys 0.48`, whose
+# per-architecture import library never reached the linker on the Windows 7 target and broke that
+# build at the last step. One `winreg` in the tree means one `windows-sys` in the tree.
+winreg = "0.56"
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+]
+
+[dependencies.tokio]
+optional = true
+version = "1"
+features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"]
+
+[dependencies.reqwest]
+optional = true
+version = "0.12"
+default-features = false
+features = ["rustls-tls", "http2"]

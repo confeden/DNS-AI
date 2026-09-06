@@ -1,0 +1,77 @@
+[package]
+name = "dns-ai-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "DNS-AI for Windows: one executable that is both the LocalSystem service (local DoH stub, adapter DNS) and the unelevated tray UI."
+
+# One binary, three roles, chosen from argv. See src/main.rs for why the two files became one.
+[[bin]]
+name = "dns-ai"
+path = "src/main.rs"
+
+[dependencies]
+# The full core, stub included: unlike the old split, this binary IS the service as well.
+dns-ai-core.workspace = true
+anyhow.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+windows-service = "0.7"
+winreg = "0.56.0"
+
+# Trimmed to what a Windows tray window actually uses. What the default set added and why each one
+# is gone:
+#   default_fonts  — embedded Ubuntu, Hack and two emoji fonts, ~2 MB of a binary that already
+#                    fights SmartScreen for being large and unsigned-by-a-known-root. The window
+#                    loads Segoe UI from the machine instead (`brand.rs`), which is also what makes
+#                    it look like the rest of Windows.
+#   accesskit      — a UI Automation provider. Dropped for size; the cost is that a screen reader
+#                    sees an unlabelled window, which is a real regression and the reason it is
+#                    written down here rather than only in a commit message.
+#   links, wayland, x11, web_screen_reader — Linux, web, or opening a browser. None of it runs here.
+# BOTH renderers are compiled in, and the machines they fail on do not overlap. `wgpu` reaches
+# D3D12 and therefore WARP, so it starts on a VM with no GPU driver and inside an RDP session —
+# where `glow` cannot, because those have no OpenGL 3.2. And `glow` starts on a Windows older than
+# D3D12, where `wgpu` has nothing to reach at all. `ui::run` tries wgpu and falls back to glow, so
+# the range covered is a bare VM at one end and Windows 7 at the other. It costs about 2 MB.
+[dependencies.eframe]
+version = "0.36.1"
+default-features = false
+features = ["wgpu", "glow"]
+
+# `default` is `libxdo`, which is X11's keyboard tool. Nothing of it exists on Windows.
+[dependencies.tray-icon]
+version = "0.24.2"
+default-features = false
+
+[dependencies.tokio]
+version = "1"
+features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "signal"]
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Memory",
+    # Asking for administrator rights for one verb (elevate.rs). Registry is not used directly:
+    # SHELLEXECUTEINFOW carries an HKEY field, so windows-sys gates the whole struct behind it.
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    # ChangeServiceConfigW for one DWORD: the «Автозапуск службы в фоне» switch (service.rs).
+    "Win32_System_Services",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+# Build-time only: turns the mark in `src/mark.rs` into the icon resource that Explorer, the Start
+# menu and "Apps & features" read off the file, and writes the version block the UAC prompt shows
+# as the program's name. Nothing of it reaches the binary except the resource itself.
+[build-dependencies]
+winresource = "0.1"

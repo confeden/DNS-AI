@@ -1,0 +1,31 @@
+# Build settings that belong to the product rather than to a machine.
+#
+# **The C runtime is linked statically**, and that is a deployment decision, not a taste one.
+# `VCRUNTIME140.dll` is not part of Windows — it arrives with the Visual C++ redistributable — and
+# the Universal CRT (`api-ms-win-crt-*.dll`) is only part of Windows 10 and newer. A dynamically
+# linked build therefore fails to start on a clean Windows 7, and can fail on a clean Windows 10 or
+# 11 that never had the redistributable installed, with a dialog naming a DLL the user has no way
+# to interpret. This program is one downloadable file that installs itself; there is no second
+# artifact to ship a runtime in. It costs about 220 KB.
+[target.'cfg(target_env = "msvc")']
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# **One artifact, Windows 7 through 11.** There is no second "modern" build: two files would mean
+# two things to sign, two to publish and one question ("which do I download?") for every user. The
+# Windows 7 target is a strict subset — it only stops the standard library importing APIs that
+# Windows 10 introduced (`WaitOnAddress`, `ProcessPrng`), which a loader on 7 refuses before `main`
+# runs — so the binary it produces is the right one for every version we support.
+#
+# It is a **Tier 3** target: no prebuilt standard library, so it is compiled from source here, which
+# needs a nightly toolchain and the `rust-src` component. The directory is pinned to nightly with
+# `rustup override`, so plain `cargo build --release` does the right thing:
+#
+#     rustup toolchain install nightly --profile minimal --component rust-src
+#     rustup override set nightly          # once, in this directory
+#
+# The output is `target/x86_64-win7-windows-msvc/release/dns-ai.exe`.
+[build]
+target = "x86_64-win7-windows-msvc"
+
+[unstable]
+build-std = ["std", "panic_abort"]
