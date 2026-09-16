@@ -34,6 +34,7 @@ features = [
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_SystemInformation",
 ]

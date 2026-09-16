@@ -1,13 +1,25 @@
 //! The service's state machine: the only code in the product that changes system DNS.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use dns_ai_core::backup::DnsBackup;
 use dns_ai_core::config::{self, Mode, Settings, ADAPTER_DNS_V4, ADAPTER_DNS_V6};
 use dns_ai_core::ipc::{AdapterView, Status};
-use dns_ai_core::netif::{self, DnsState, Family};
+use dns_ai_core::netif::{self, DnsState, DohEntry, Family};
 use dns_ai_core::stub::{self, Stats, StubHandle};
+
+/// How long enabling native mode may wait to find out where the resolver is.
+///
+/// Short on purpose: this is on the path of a button press and of a boot where the network may not
+/// be up yet. Running out of it is not a failure — the list already on disk, and behind it the one
+/// compiled into this build, is what gets written.
+const REFRESH_BUDGET: Duration = Duration::from_millis(2500);
+
+/// And how long it may then spend asking the outside world where the resolver went, when none of
+/// the addresses it knows about answered at all.
+const RESCUE_BUDGET: Duration = Duration::from_secs(8);
 
 pub struct App {
     settings: Settings,
@@ -101,7 +113,27 @@ impl App {
     pub async fn enable(&mut self) -> Result<()> {
         match self.settings.mode {
             Mode::Stub => self.enable_stub().await,
-            Mode::Native => self.enable_native(),
+            Mode::Native => {
+                // The addresses are about to be written into an adapter, where nothing of ours can
+                // notice they have gone stale: in native mode Windows resolves and this program is
+                // not in the path. So this is the moment to ask where the resolver actually is —
+                // the stub's warm-up does the same thing for the other mode, free, because it was
+                // already asking (`dns_ai_core::endpoints`).
+                if stub::refresh_endpoints(REFRESH_BUDGET).await.is_none() {
+                    // Nothing we know about answered. In stub mode the resolver's own failures
+                    // would start this search within seconds; here there is no stub to fail, so a
+                    // machine enabled at boot against addresses that have moved would sit with no
+                    // DNS until somebody opened the window. Bounded, because the alternative is a
+                    // button that hangs on a machine that is merely offline.
+                    log::warn!("no known address answered; looking for the resolver before enabling");
+                    let _ = tokio::time::timeout(
+                        RESCUE_BUDGET,
+                        dns_ai_core::endpoints::rescue(),
+                    )
+                    .await;
+                }
+                self.enable_native()
+            }
         }
     }
 
@@ -120,7 +152,8 @@ impl App {
         } else {
             Vec::new()
         };
-        self.apply_to_adapters(&v4, &v6)
+        let (selection, _) = self.back_up()?;
+        self.write_adapters(&selection.chosen, &v4, &v6, false)
     }
 
     /// Adapters -> the resolver's real addresses, and Windows does the encryption.
@@ -151,56 +184,68 @@ impl App {
             Vec::new()
         };
 
+        // Three steps, in an order each of which is load-bearing: the backup reaches the disk,
+        // then the templates, then the addresses.
+        //
         // The templates go in BEFORE the addresses. The reverse order leaves a window in which
         // the adapter points at a resolver Windows has no template for and no permission to reach
         // over UDP — which is not "briefly unencrypted", it is briefly nothing.
         //
+        // And the backup goes in before the templates, with the templates we are about to add
+        // already CLAIMED in it. They used to be recorded only after the adapters had taken the
+        // change, and a process that died in between — several `netsh` runs wide — left
+        // templates in Windows that no file named. The next start then found them present, took
+        // them for somebody else's, and nothing ever removed them. A claim for a template that
+        // never got added costs nothing: removing an absent one is a silent success (measured).
+        let had_backup = DnsBackup::exists();
+        let (selection, mut backup) = self.back_up()?;
+
         // One per ADDRESS, v6 included: Windows matches a template to the server it is about to
         // query, so a v6 address with no template is one Windows would only talk to in the clear —
-        // and our nodes do not answer that at all (ROADMAP G35).
-        let mut added = Vec::new();
+        // and our nodes do not answer that at all (ROADMAP G35). A template that is already there
+        // is left alone and unclaimed: the PowerShell installer left exactly these behind, and a
+        // revert that deleted them would be removing configuration this program never made.
+        let mut missing = Vec::new();
         for ip in v4.iter().chain(v6.iter()) {
-            if netif::doh_template_exists(ip) {
-                log::info!("DoH template for {ip} already exists — leaving it alone");
-                continue;
-            }
-            netif::doh_template_add(ip, config::DOH_URL)
-                .with_context(|| format!("не удалось зарегистрировать DoH-шаблон для {ip}"))?;
-            log::info!("registered DoH template {} -> {}", ip, config::DOH_URL);
-            added.push(ip.clone());
-        }
-
-        let result = self.apply_to_adapters(&v4, &v6);
-
-        if result.is_ok() {
-            // Recorded only after the adapters actually took the change, so a failed enable does
-            // not leave the revert believing it owns templates it should delete.
-            //
-            // ADDED to the list, never assigned over it. A template we registered on an earlier
-            // run is skipped by `doh_template_exists` above and so is absent from `added` — and
-            // that is the ordinary case after an unclean stop, where the templates are still in
-            // Windows and the backup still names them. Overwriting the list there orphaned them
-            // permanently: nothing else in the program removes a template it cannot name.
-            if let Some(mut backup) = DnsBackup::load() {
-                for ip in added {
-                    if !backup.doh_added.contains(&ip) {
-                        backup.doh_added.push(ip);
+            match netif::doh_template_lookup(ip) {
+                Some(true) => log::info!("DoH template for {ip} already exists — leaving it alone"),
+                Some(false) => missing.push(ip.clone()),
+                // `netsh` could not be asked. Reading that as "absent" would claim a template that
+                // may be somebody else's — and `add` does not refuse an existing entry, so nothing
+                // after this would notice until a revert deleted it. A failed enable is the
+                // smaller harm. Nothing is claimed yet, so only a backup this call made goes.
+                None => {
+                    if !had_backup {
+                        DnsBackup::delete();
                     }
+                    bail!("не удалось проверить DoH-шаблон для {ip} (netsh dns show encryption)");
                 }
-                let _ = backup.save();
-            }
-        } else {
-            for ip in &added {
-                let _ = netif::doh_template_remove(ip);
             }
         }
-        result
+        let claimed = claim_templates(&mut backup, &missing);
+        if !claimed.is_empty() {
+            backup
+                .save()
+                .context("не удалось сохранить резервную копию настроек DNS")?;
+        }
+
+        for ip in &missing {
+            if let Err(e) = netif::doh_template_add(ip, config::DOH_URL) {
+                withdraw_templates(&mut backup, &missing, &claimed, had_backup);
+                return Err(e)
+                    .with_context(|| format!("не удалось зарегистрировать DoH-шаблон для {ip}"));
+            }
+            log::info!("registered DoH template {} -> {}", ip, config::DOH_URL);
+        }
+
+        // A failure from here on rolls back through `restore_from_backup`, which removes every
+        // claimed template along with the adapters' previous state.
+        self.write_adapters(&selection.chosen, &v4, &v6, true)
     }
 
-    /// The half both modes share: back up, then write, rolling everything back on first failure.
-    ///
-    /// `v6` empty means "static, none" — the v6 side is emptied, never left as it was.
-    fn apply_to_adapters(&mut self, v4: &[String], v6: &[String]) -> Result<()> {
+    /// The first half both modes share: choose the adapters and get their current state onto the
+    /// disk. Nothing on the machine changes here.
+    fn back_up(&self) -> Result<(netif::AdapterSelection, DnsBackup)> {
         let selection = netif::select_adapters(self.settings.include_vpn_adapters)?;
         if selection.chosen.is_empty() {
             bail!("не найдено ни одного подходящего адаптера (все виртуальные, туннельные или без шлюза)");
@@ -228,9 +273,34 @@ impl App {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        Ok((selection, backup))
+    }
 
-        for a in &selection.chosen {
-            if let Err(e) = netif::set_dns_static(a.index, Family::V4, v4) {
+    /// The second half: write, rolling everything back on first failure. Only ever called after
+    /// [`Self::back_up`] has put the previous state on the disk.
+    ///
+    /// `v6` empty means "static, none" — the v6 side is emptied, never left as it was.
+    ///
+    /// `encrypted` is native mode: the servers go in together with the adapter's own DoH switch
+    /// ([`netif::set_dns_encrypted`]). Writing only the addresses, as `netsh` does, left Windows
+    /// showing «Незашифровано» against both of them although both templates were registered.
+    fn write_adapters(
+        &mut self,
+        chosen: &[netif::Adapter],
+        v4: &[String],
+        v6: &[String],
+        encrypted: bool,
+    ) -> Result<()> {
+        let write = |a: &netif::Adapter, family: Family, servers: &[String]| {
+            if encrypted && !servers.is_empty() {
+                netif::set_dns_encrypted(&a.guid, family, servers)
+            } else {
+                netif::set_dns_static(a.index, family, servers)
+            }
+        };
+
+        for a in chosen {
+            if let Err(e) = write(a, Family::V4, v4) {
                 log::error!("could not configure {}: {e:#}; rolling back", a.alias);
                 if let Err(re) = restore_from_backup() {
                     log::error!("rollback itself failed: {re:#}");
@@ -242,10 +312,15 @@ impl App {
             // have the protocol switched off on the adapter — where `netsh` refuses a v6 command
             // outright. Rolling the whole enable back for that would mean the users most likely to
             // turn the switch off are the ones who cannot turn protection on.
-            if let Err(e) = netif::set_dns_static(a.index, Family::V6, v6) {
+            if let Err(e) = write(a, Family::V6, v6) {
                 log::warn!("{}: IPv6 DNS left as it was ({e:#})", a.alias);
             }
-            log::info!("{} -> {}", a.alias, v4.join(", "));
+            log::info!(
+                "{} -> {}{}",
+                a.alias,
+                v4.join(", "),
+                if encrypted { " (DoH)" } else { "" }
+            );
         }
 
         netif::flush_dns_cache();
@@ -261,7 +336,7 @@ impl App {
         netif::flush_dns_cache();
 
         // The stub stops only after the adapters no longer point at it.
-        self.stop_stub();
+        self.stop_stub().await;
         self.enabled = false;
         self.settings.enabled = false;
         let _ = self.settings.save();
@@ -297,8 +372,8 @@ impl App {
     ///
     /// The stub is stopped because it is a listener inside this process and it is going anyway;
     /// nothing on the machine is rewritten to say so.
-    pub fn release(&mut self) {
-        self.stop_stub();
+    pub async fn release(&mut self) {
+        self.stop_stub().await;
     }
 
     /// Service stop or machine shutdown. Restores the adapters but keeps the backup and the
@@ -307,14 +382,14 @@ impl App {
     /// Unlike [`Self::release`] this one does revert, and the asymmetry is deliberate: a service
     /// that stops is the *resolver* leaving a machine that may not get it back — nobody has to log
     /// in for a service to be stopped — while a window closing is a user putting a window away.
-    pub fn on_stop(&mut self) {
+    pub async fn on_stop(&mut self) {
         if self.enabled {
             if let Err(e) = restore_from_backup() {
                 log::error!("could not restore DNS while stopping: {e:#}");
             }
             netif::flush_dns_cache();
         }
-        self.stop_stub();
+        self.stop_stub().await;
     }
 
     async fn ensure_stub(&mut self) -> Result<()> {
@@ -326,9 +401,9 @@ impl App {
         Ok(())
     }
 
-    fn stop_stub(&mut self) {
+    async fn stop_stub(&mut self) {
         if let Some(h) = self.stub.take() {
-            h.stop();
+            h.stop().await;
         }
     }
 
@@ -422,7 +497,7 @@ pub fn restore_from_backup() -> Result<Vec<String>> {
             warnings.push(format!("{}: пропущено значение {d}", record.alias));
         }
 
-        let index = match live.iter().find(|a| a.guid == record.guid) {
+        let live_adapter = match live.iter().find(|a| a.guid == record.guid) {
             Some(a) => {
                 if a.index != record.index {
                     log::warn!(
@@ -432,7 +507,7 @@ pub fn restore_from_backup() -> Result<Vec<String>> {
                         a.index
                     );
                 }
-                a.index
+                a
             }
             None => {
                 warnings.push(format!(
@@ -451,6 +526,16 @@ pub fn restore_from_backup() -> Result<Vec<String>> {
             describe(&clean.v4),
             describe(&clean.v6)
         );
+
+        // The DoH entries go back BEFORE the addresses: the address change is what makes Windows
+        // re-read the adapter, and a restored server should come back already encrypted.
+        //
+        // The live adapter's GUID, not the file's: equal by the match above, but only one of them
+        // came from a file, and this one becomes part of a registry path.
+        let (index, guid) = (live_adapter.index, live_adapter.guid.as_str());
+        for (family, saved) in [(Family::V4, &clean.doh_v4), (Family::V6, &clean.doh_v6)] {
+            restore_doh_entries(guid, &record.alias, family, saved.as_deref(), &mut warnings);
+        }
 
         if let Err(e) = netif::apply_state(index, Family::V4, &clean.v4) {
             warnings.push(format!("{}: IPv4 не восстановлен ({e})", record.alias));
@@ -475,10 +560,125 @@ pub fn restore_from_backup() -> Result<Vec<String>> {
     Ok(warnings)
 }
 
+/// Puts one family's per-adapter DoH entries back the way the backup found them.
+///
+/// Our entries go — every one naming a resolver address that the backup does not also name, since
+/// the adapter is about to stop using those servers. The backup names one only when the user's own
+/// list contained that address (`doh_entry_is_ours` in `backup.rs`), and then it stays. The saved
+/// ones come back only where they differ from what is there, so a revert of stub mode, which never
+/// touched them, writes nothing. Entries that are neither ours nor saved are left alone: they are
+/// somebody's, and not ours to judge.
+fn restore_doh_entries(
+    guid: &str,
+    alias: &str,
+    family: Family,
+    saved: Option<&[DohEntry]>,
+    warnings: &mut Vec<String>,
+) {
+    let saved = saved.unwrap_or_default();
+    let current = netif::read_doh_entries(guid, family);
+    let ours = current.iter().filter(|e| {
+        config::is_resolver_address(&e.server)
+            && !saved.iter().any(|s| netif::same_address(&s.server, &e.server))
+    });
+    for entry in ours {
+        match netif::delete_doh_entry(guid, family, &entry.server) {
+            Ok(()) => log::info!("{alias}: removed our DoH switch for {}", entry.server),
+            Err(e) => warnings.push(format!("{alias}: DoH для {} не снят ({e})", entry.server)),
+        }
+    }
+    for entry in saved {
+        if current.contains(entry) {
+            continue;
+        }
+        match netif::write_doh_entry(guid, family, entry) {
+            Ok(()) => log::info!("{alias}: restored the DoH switch for {}", entry.server),
+            Err(e) => warnings.push(format!("{alias}: DoH для {} не восстановлен ({e})", entry.server)),
+        }
+    }
+}
+
+/// Undoes the template step of a native enable that failed before any adapter was touched.
+///
+/// Every template this call may have added is removed, and a claim is withdrawn only once its
+/// template is confirmed gone. Withdrawing the claim for one whose removal failed would recreate
+/// the very orphan claiming exists to prevent: Windows keeps the template, no file names it, and
+/// the next enable takes it for somebody else's. So a backup this call created is deleted only
+/// when nothing is left owing; otherwise it stays, and the next start — which reads a backup
+/// with protection off as an unclean shutdown — finishes the removal.
+fn withdraw_templates(
+    backup: &mut DnsBackup,
+    missing: &[String],
+    claimed: &[String],
+    had_backup: bool,
+) {
+    let unremoved: Vec<&String> = missing
+        .iter()
+        .filter(|ip| match netif::doh_template_remove(ip) {
+            Ok(()) => false,
+            Err(e) => {
+                log::error!("could not remove the DoH template for {ip}: {e:#}");
+                true
+            }
+        })
+        .collect();
+    let withdrawn: Vec<&String> = claimed.iter().filter(|s| !unremoved.contains(s)).collect();
+    backup.doh_added.retain(|s| !withdrawn.contains(&s));
+
+    if !had_backup && backup.doh_added.is_empty() {
+        DnsBackup::delete();
+    } else if !withdrawn.is_empty() {
+        if let Err(e) = backup.save() {
+            log::error!("could not save the backup after withdrawing template claims: {e:#}");
+        }
+    }
+}
+
+/// Adds to the backup's `doh_added` every address in `missing` it does not already name, and
+/// returns the ones this call added — the claims a failed enable has to take back.
+///
+/// Added to, never assigned over: a claim from an earlier run is still owed a removal even when
+/// its template is present today, and a list replaced wholesale would orphan it.
+fn claim_templates(backup: &mut DnsBackup, missing: &[String]) -> Vec<String> {
+    let mut claimed = Vec::new();
+    for ip in missing {
+        if !backup.doh_added.contains(ip) {
+            backup.doh_added.push(ip.clone());
+            claimed.push(ip.clone());
+        }
+    }
+    claimed
+}
+
 fn describe(state: &DnsState) -> String {
     match state {
         DnsState::Dhcp => "автоматически (DHCP)".to_string(),
         DnsState::Static(list) if list.is_empty() => "вручную, пусто".to_string(),
         DnsState::Static(list) => list.join(", "),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The claim that survives a crash is the one that is already on the list. Only new claims
+    /// are handed back for a failed enable to withdraw — withdrawing an old one would orphan a
+    /// template an earlier run registered.
+    #[test]
+    fn claims_are_added_and_only_new_ones_are_returned() {
+        let mut backup = DnsBackup {
+            created_unix: 1,
+            adapters: Vec::new(),
+            doh_added: vec!["2a0d:8480:0:67c::14".into()],
+        };
+        let missing = vec!["2a0d:8480:0:67c::14".to_string(), "2a0a:2b41:0:500d::53".into()];
+
+        let claimed = claim_templates(&mut backup, &missing);
+        assert_eq!(claimed, vec!["2a0a:2b41:0:500d::53".to_string()]);
+        assert_eq!(backup.doh_added, missing);
+
+        assert!(claim_templates(&mut backup, &missing).is_empty());
+        assert_eq!(backup.doh_added.len(), 2, "claiming twice must not duplicate");
     }
 }

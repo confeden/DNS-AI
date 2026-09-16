@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::netif::{DnsState, Family};
+use crate::netif::{DnsState, DohEntry, Family};
 use crate::paths;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +25,16 @@ pub struct AdapterBackup {
     pub alias: String,
     pub v4: DnsState,
     pub v6: DnsState,
+    /// The adapter's per-address DoH entries before we touched them, ours excluded.
+    ///
+    /// Native mode's switch replaces every entry of a family, so without this a user who had
+    /// «Шифрование DNS» on for their own servers would get those servers back unencrypted.
+    /// `None` is a backup written by a build that never touched these entries — there the revert
+    /// removes ours and leaves everything else alone.
+    #[serde(default)]
+    pub doh_v4: Option<Vec<DohEntry>>,
+    #[serde(default)]
+    pub doh_v6: Option<Vec<DohEntry>>,
 }
 
 impl AdapterBackup {
@@ -58,6 +68,14 @@ impl AdapterBackup {
         };
         let v4 = clean(&self.v4, "IPv4", &mut dropped);
         let v6 = clean(&self.v6, "IPv6", &mut dropped);
+        let doh_v4 = self
+            .doh_v4
+            .as_ref()
+            .map(|e| clean_doh(e, &v4, "DoH IPv4", &mut dropped));
+        let doh_v6 = self
+            .doh_v6
+            .as_ref()
+            .map(|e| clean_doh(e, &v6, "DoH IPv6", &mut dropped));
         (
             AdapterBackup {
                 index: self.index,
@@ -66,10 +84,41 @@ impl AdapterBackup {
                 alias: self.alias.clone(),
                 v4,
                 v6,
+                doh_v4,
+                doh_v6,
             },
             dropped,
         )
     }
+}
+
+/// The DoH half of [`AdapterBackup::sanitised`]. The server becomes a registry key NAME, so it has
+/// to be an address and nothing else — a backslash in it would be a path. The spelling is kept as
+/// read, because it is Windows' own name for the entry. Entries that are ours by
+/// [`doh_entry_is_ours`] are dropped silently: they are nobody's previous configuration.
+fn clean_doh(
+    entries: &[DohEntry],
+    state: &DnsState,
+    family: &str,
+    dropped: &mut Vec<String>,
+) -> Vec<DohEntry> {
+    let https = |t: &str| {
+        t.get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    };
+    entries
+        .iter()
+        .filter(|e| !doh_entry_is_ours(e, state))
+        .filter(|e| {
+            let ok =
+                e.server.parse::<IpAddr>().is_ok() && e.template.as_deref().map_or(true, https);
+            if !ok {
+                dropped.push(format!("{family}: {}", e.server));
+            }
+            ok
+        })
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,10 +148,7 @@ pub struct DnsBackup {
 fn is_ours(server: &str) -> bool {
     server == crate::config::ADAPTER_DNS_V4
         || server == crate::config::ADAPTER_DNS_V6
-        || server.parse::<IpAddr>().is_ok_and(|ip| match ip {
-            IpAddr::V4(v4) => crate::config::RESOLVER_IPS.contains(&v4),
-            IpAddr::V6(v6) => crate::config::RESOLVER_IPV6.contains(&v6),
-        })
+        || crate::config::is_resolver_address(server)
 }
 
 /// Refuses to record our own addresses as somebody's previous configuration.
@@ -127,17 +173,72 @@ fn not_ours(state: DnsState) -> DnsState {
     }
 }
 
+/// [`not_ours`] for DoH entries, and it follows the same rule: an entry for a resolver address is
+/// ours — unless the configuration being recorded is a list somebody built that names that address.
+///
+/// Dropping it there would be the mixed-list case going wrong quietly: the list comes back with our
+/// address in it and no switch, Windows asks that address over plain `:53`, and our nodes do not
+/// answer that at all — every query spent on it becomes a timeout.
+fn doh_entry_is_ours(entry: &DohEntry, state: &DnsState) -> bool {
+    crate::config::is_resolver_address(&entry.server)
+        && !matches!(state, DnsState::Static(list)
+            if list.iter().any(|s| crate::netif::same_address(s, &entry.server)))
+}
+
+fn doh_not_ours(entries: Vec<DohEntry>, state: &DnsState) -> Vec<DohEntry> {
+    entries
+        .into_iter()
+        .filter(|e| !doh_entry_is_ours(e, state))
+        .collect()
+}
+
+/// An earlier row's DoH reading, plus whatever has appeared since for addresses it does not name.
+///
+/// Not the old row alone, the way the server lists are kept. A backup outlives many cycles — every
+/// service stop reverts and keeps it — and between two of them the user can switch encryption on
+/// for a server of their own in Settings. The next enable replaces every entry of the family, so an
+/// entry missing from the row is gone for good. Where both name an address the old row wins, as it
+/// does for everything else. `None` in the old row is a build that never touched these entries, so
+/// today's reading is the user's own.
+fn merge_doh(old: Option<&Vec<DohEntry>>, fresh: Option<Vec<DohEntry>>) -> Option<Vec<DohEntry>> {
+    let Some(old) = old else {
+        return fresh;
+    };
+    let mut merged = old.clone();
+    for entry in fresh.into_iter().flatten() {
+        if !merged
+            .iter()
+            .any(|m| crate::netif::same_address(&m.server, &entry.server))
+        {
+            merged.push(entry);
+        }
+    }
+    Some(merged)
+}
+
 impl DnsBackup {
     pub fn capture(adapters: &[crate::netif::Adapter]) -> Self {
         let adapters = adapters
             .iter()
-            .map(|a| AdapterBackup {
-                index: a.index,
-                ipv6_index: a.ipv6_index,
-                guid: a.guid.clone(),
-                alias: a.alias.clone(),
-                v4: not_ours(crate::netif::read_dns_state(&a.guid, Family::V4)),
-                v6: not_ours(crate::netif::read_dns_state(&a.guid, Family::V6)),
+            .map(|a| {
+                let v4 = not_ours(crate::netif::read_dns_state(&a.guid, Family::V4));
+                let v6 = not_ours(crate::netif::read_dns_state(&a.guid, Family::V6));
+                let doh = |family, state| {
+                    Some(doh_not_ours(
+                        crate::netif::read_doh_entries(&a.guid, family),
+                        state,
+                    ))
+                };
+                AdapterBackup {
+                    index: a.index,
+                    ipv6_index: a.ipv6_index,
+                    guid: a.guid.clone(),
+                    alias: a.alias.clone(),
+                    doh_v4: doh(Family::V4, &v4),
+                    doh_v6: doh(Family::V6, &v6),
+                    v4,
+                    v6,
+                }
             })
             .collect();
         Self {
@@ -177,6 +278,10 @@ impl DnsBackup {
                 // so today's index is kept and only the recorded STATE comes from the old row.
                 a.v4 = old.v4.clone();
                 a.v6 = old.v6.clone();
+                // The DoH readings are merged instead — see `merge_doh` for why they cannot be
+                // simply kept.
+                a.doh_v4 = merge_doh(old.doh_v4.as_ref(), a.doh_v4.take());
+                a.doh_v6 = merge_doh(old.doh_v6.as_ref(), a.doh_v6.take());
             }
         }
         for old in previous.adapters {
@@ -191,11 +296,27 @@ impl DnsBackup {
         fresh
     }
 
+    /// Written beside the real file, flushed, then renamed over it — never truncated in place.
+    ///
+    /// `std::fs::write` truncates first, so a process that died mid-write left an empty or cut-off
+    /// file, `load` read that as "no backup", and the only record of the machine's real DNS was
+    /// gone. Native mode saves this file several times per enable, which made that window worth
+    /// closing. A rename within one folder replaces the old file whole or not at all.
     pub fn save(&self) -> Result<()> {
+        use std::io::Write;
+
         paths::ensure_data_dir()?;
         let path = paths::backup_file();
+        let tmp = path.with_extension("json.tmp");
         let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, text).with_context(|| format!("cannot write {}", path.display()))?;
+        let mut file = std::fs::File::create(&tmp)
+            .with_context(|| format!("cannot write {}", tmp.display()))?;
+        file.write_all(text.as_bytes())
+            .and_then(|()| file.sync_all())
+            .with_context(|| format!("cannot write {}", tmp.display()))?;
+        drop(file);
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("cannot replace {}", path.display()))?;
         Ok(())
     }
 
@@ -263,6 +384,94 @@ mod tests {
     /// A written v6 address does not have to be spelled the way the file spells it: `2a0d:8480:0:67c::14`
     /// and `2A0D:8480:0000:067C::0014` are one address, and a comparison on the text would say they
     /// are two.
+    /// A DoH entry name becomes a registry key under the adapter, so the backup may only ever name
+    /// an address there — and never one of ours, which would re-enable encryption for a server the
+    /// restored adapter does not have.
+    #[test]
+    fn doh_entries_from_the_file_are_addresses_and_never_ours() {
+        let entry = |server: &str, template: Option<&str>| DohEntry {
+            server: server.into(),
+            flags: 1,
+            template: template.map(str::to_string),
+        };
+        let row = AdapterBackup {
+            index: 1,
+            ipv6_index: 1,
+            guid: "{E6AF56C0-9A53-4678-9CB8-A69ADE6489F1}".into(),
+            alias: "Ethernet".into(),
+            v4: DnsState::Dhcp,
+            v6: DnsState::Dhcp,
+            doh_v4: Some(vec![
+                entry("1.1.1.1", None),
+                entry("192.144.59.14", None),
+                entry(r"1.1.1.1\..\x", None),
+                entry("9.9.9.9", Some("file://c:/x")),
+            ]),
+            doh_v6: None,
+        };
+        let (clean, dropped) = row.sanitised();
+        assert_eq!(clean.doh_v4, Some(vec![entry("1.1.1.1", None)]));
+        assert_eq!(clean.doh_v6, None, "no reading must stay no reading");
+        assert_eq!(dropped.len(), 2, "{dropped:?}");
+    }
+
+    /// The mixed-list rule, for DoH: a list the user built with one of our addresses in it keeps
+    /// that address's switch. Without it the list comes back asking our node over plain `:53`.
+    #[test]
+    fn a_user_list_naming_our_address_keeps_its_switch() {
+        let ours = DohEntry {
+            server: "192.144.59.14".into(),
+            flags: 1,
+            template: None,
+        };
+        let mixed = DnsState::Static(vec!["1.1.1.1".into(), "192.144.59.14".into()]);
+        assert!(!doh_entry_is_ours(&ours, &mixed));
+        assert!(doh_entry_is_ours(&ours, &DnsState::Dhcp));
+        assert!(doh_entry_is_ours(
+            &ours,
+            &DnsState::Static(vec!["1.1.1.1".into()])
+        ));
+
+        let cased = DohEntry {
+            server: "9.9.9.9".into(),
+            flags: 2,
+            template: Some("HTTPS://dns.quad9.net/dns-query".into()),
+        };
+        let kept = clean_doh(&[ours.clone(), cased.clone()], &mixed, "t", &mut Vec::new());
+        assert_eq!(kept, vec![ours, cased]);
+    }
+
+    /// A backup lives through many enable/stop cycles. An entry the user added in between must
+    /// survive the next enable — which replaces every entry — while the old row still wins where
+    /// both name the same address.
+    #[test]
+    fn a_later_user_entry_is_merged_into_the_old_reading() {
+        let e = |server: &str, flags: u64| DohEntry {
+            server: server.into(),
+            flags,
+            template: None,
+        };
+        let old = vec![e("1.1.1.1", 1)];
+        let fresh = Some(vec![e("1.1.1.1", 2), e("9.9.9.9", 1)]);
+        assert_eq!(
+            merge_doh(Some(&old), fresh.clone()),
+            Some(vec![e("1.1.1.1", 1), e("9.9.9.9", 1)])
+        );
+        assert_eq!(merge_doh(None, fresh.clone()), fresh);
+        assert_eq!(merge_doh(Some(&old), None), Some(old.clone()));
+    }
+
+    /// A backup written before these fields existed must still load — it is the file that puts
+    /// the machine back.
+    #[test]
+    fn a_backup_without_doh_fields_still_loads() {
+        let text = r#"{"created_unix":1,"adapters":[{"index":29,"ipv6_index":29,
+            "guid":"{E6AF56C0-9A53-4678-9CB8-A69ADE6489F1}","alias":"Ethernet",
+            "v4":{"mode":"Dhcp"},"v6":{"mode":"Dhcp"}}],"doh_added":[]}"#;
+        let b: DnsBackup = serde_json::from_str(text).unwrap();
+        assert_eq!(b.adapters[0].doh_v4, None);
+    }
+
     #[test]
     fn addresses_are_compared_as_addresses_not_as_text() {
         assert!(is_ours("2A0D:8480:0000:067C:0000:0000:0000:0014"));

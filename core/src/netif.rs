@@ -17,13 +17,20 @@ use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
 use windows_sys::Win32::Globalization::{GetOEMCP, MultiByteToWideChar};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    GetAdaptersAddresses, GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST,
+    DnsServerDohProperty, GetAdaptersAddresses, DNS_DOH_SERVER_SETTINGS,
+    DNS_DOH_SERVER_SETTINGS_ENABLE_AUTO, DNS_INTERFACE_SETTINGS3, DNS_INTERFACE_SETTINGS_VERSION3,
+    DNS_SERVER_PROPERTY, DNS_SERVER_PROPERTY_TYPES, DNS_SERVER_PROPERTY_VERSION1, DNS_SETTING_DOH,
+    DNS_SETTING_IPV6, DNS_SETTING_NAMESERVER, GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST,
     GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
 };
 use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+};
 use winreg::enums::HKEY_LOCAL_MACHINE;
 use winreg::RegKey;
 
@@ -452,8 +459,21 @@ pub fn doh_template_add(server: &str, template: &str) -> Result<()> {
     ])
 }
 
+/// Removes the template for `server`. Removing one that is not there is a success.
+///
+/// On 26100 `netsh` itself says so — exit 0, no output, for an absent entry, v4 and v6 alike
+/// (measured). The fallback below is for the builds that have not been measured: a failure that
+/// leaves no template behind is still the outcome the caller asked for. It matters because the
+/// backup claims a template BEFORE adding it, so a revert after a crash can name one that never
+/// got in, and a warning there would keep the backup — and the machine's revert — pending for ever.
 pub fn doh_template_remove(server: &str) -> Result<()> {
-    netsh(&["dns", "delete", "encryption", &format!("server={server}")])
+    match netsh(&["dns", "delete", "encryption", &format!("server={server}")]) {
+        Err(e) if doh_template_lookup(server) == Some(false) => {
+            log::debug!("no DoH template for {server} to remove ({e:#})");
+            Ok(())
+        }
+        other => other,
+    }
 }
 
 /// Whether Windows already knows a template for this address.
@@ -462,17 +482,245 @@ pub fn doh_template_remove(server: &str) -> Result<()> {
 /// before us must survive our uninstall. The machine this was first run on already carried
 /// exactly these two entries, added by the PowerShell installer weeks earlier.
 pub fn doh_template_exists(server: &str) -> bool {
+    doh_template_lookup(server) == Some(true)
+}
+
+/// `None` when `netsh` could not be asked at all — which must not read as "there is none".
+pub fn doh_template_lookup(server: &str) -> Option<bool> {
     let mut cmd = Command::new("netsh");
     cmd.args(["dns", "show", "encryption", &format!("server={server}")]);
-    match cmd.creation_flags(no_window()).output() {
-        Ok(out) => {
-            let text = oem_to_string(&out.stdout);
-            // `show encryption` exits 0 whether or not the entry exists; the presence of the
-            // template line is the only reliable signal.
-            out.status.success() && text.to_lowercase().contains("https://")
-        }
-        Err(_) => false,
+    let out = cmd.creation_flags(no_window()).output().ok()?;
+    if !out.status.success() {
+        return None;
     }
+    // `show encryption` exits 0 whether or not the entry exists, with empty output for an absent
+    // one (measured on 26100); the presence of the template line is the only reliable signal.
+    Some(
+        oem_to_string(&out.stdout)
+            .to_lowercase()
+            .contains("https://"),
+    )
+}
+
+// =============================================================================================
+// The adapter's own DoH switch (native mode, the half the template table is not)
+// =============================================================================================
+
+/// One per-adapter DoH entry, as Windows keeps it: the server address it applies to, `DohFlags`,
+/// and the template when the entry carries its own.
+///
+/// Stored in the backup, because turning our switch on replaces every entry of that family on the
+/// adapter — including ones the user set in Settings for their previous DNS servers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DohEntry {
+    /// The address exactly as the registry names the entry.
+    pub server: String,
+    pub flags: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+}
+
+/// Turns on encryption for `servers` on one family of one adapter — what Settings calls «Шифрование
+/// DNS: вкл. (автоматический шаблон)» — and makes them that family's DNS servers in the same call.
+///
+/// **The template table is not this switch, and treating it as enough was the defect.** A Windows
+/// 11 with both templates registered, `autoupgrade=yes`, still showed «Незашифровано» against both
+/// addresses. The table says which template an address has; this says whether the adapter uses it.
+/// `netsh interface … set dnsservers` neither sets nor clears it (all measured on 26100).
+///
+/// Three measured facts decide the shape:
+/// - `DNS_SETTING_DOH` without `DNS_SETTING_NAMESERVER` returns success and stores nothing, so the
+///   server list has to travel in the same call — which is also the ordering we want: there is no
+///   moment in which the adapter points at our addresses with the switch off.
+/// - The call REPLACES every entry of that family on the adapter, not just the ones it names. That
+///   is why [`read_doh_entries`] is snapshotted into the backup before it runs.
+/// - "Automatic template" (`DNS_DOH_SERVER_SETTINGS_ENABLE_AUTO`) is honoured only while the address
+///   has a template in the table, so [`doh_template_add`] still has to run first.
+///
+/// Resolved at run time rather than imported: `SetInterfaceDnsSettings` is Windows 10 2004, and a
+/// static import would stop the one Windows 7 binary loading at all (README §3). Native mode is
+/// gated to Windows 11 long before anything calls this.
+pub fn set_dns_encrypted(guid: &str, family: Family, servers: &[String]) -> Result<()> {
+    if servers.is_empty() {
+        bail!("encrypted DNS needs at least one server");
+    }
+    let interface = parse_guid(guid)?;
+    let set = set_interface_dns_settings()?;
+
+    let mut name_server: Vec<u16> = servers.join(",").encode_utf16().chain([0]).collect();
+    let mut doh: Vec<DNS_DOH_SERVER_SETTINGS> = servers
+        .iter()
+        .map(|_| DNS_DOH_SERVER_SETTINGS {
+            Template: std::ptr::null_mut(),
+            Flags: DNS_DOH_SERVER_SETTINGS_ENABLE_AUTO as u64,
+        })
+        .collect();
+    // Raw pointers into `doh`, which is neither moved nor resized until the call has returned.
+    let mut properties: Vec<DNS_SERVER_PROPERTY> = doh
+        .iter_mut()
+        .enumerate()
+        .map(|(i, d)| DNS_SERVER_PROPERTY {
+            Version: DNS_SERVER_PROPERTY_VERSION1,
+            ServerIndex: i as u32,
+            Type: DnsServerDohProperty,
+            Property: DNS_SERVER_PROPERTY_TYPES { DohSettings: d },
+        })
+        .collect();
+
+    let mut flags = DNS_SETTING_NAMESERVER | DNS_SETTING_DOH;
+    if family == Family::V6 {
+        flags |= DNS_SETTING_IPV6;
+    }
+    // Every field this call does not name in `Flags` is ignored, so zero is "leave it alone".
+    let mut settings: DNS_INTERFACE_SETTINGS3 = unsafe { std::mem::zeroed() };
+    settings.Version = DNS_INTERFACE_SETTINGS_VERSION3;
+    settings.Flags = flags as u64;
+    settings.NameServer = name_server.as_mut_ptr();
+    settings.cServerProperties = properties.len() as u32;
+    settings.ServerProperties = properties.as_mut_ptr();
+
+    let rc = unsafe { set(interface, &settings) };
+    if rc != ERROR_SUCCESS {
+        bail!(
+            "SetInterfaceDnsSettings ({}, {}) failed with code {rc}",
+            family.netsh_context(),
+            servers.join(", ")
+        );
+    }
+    Ok(())
+}
+
+type SetInterfaceDnsSettingsFn =
+    unsafe extern "system" fn(GUID, *const DNS_INTERFACE_SETTINGS3) -> u32;
+
+fn set_interface_dns_settings() -> Result<SetInterfaceDnsSettingsFn> {
+    let library: Vec<u16> = "iphlpapi.dll".encode_utf16().chain([0]).collect();
+    unsafe {
+        // System32 only: a DLL of that name beside a portable copy must never be the one loaded
+        // into a LocalSystem process.
+        let module = LoadLibraryExW(
+            library.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        );
+        if module.is_null() {
+            bail!("could not load iphlpapi.dll");
+        }
+        // The module is never freed: it is already mapped for `GetAdaptersAddresses`, and the
+        // pointer below must stay valid for the life of the process.
+        match GetProcAddress(module, c"SetInterfaceDnsSettings".as_ptr().cast()) {
+            Some(f) => Ok(std::mem::transmute::<
+                unsafe extern "system" fn() -> isize,
+                SetInterfaceDnsSettingsFn,
+            >(f)),
+            None => bail!("this Windows has no SetInterfaceDnsSettings"),
+        }
+    }
+}
+
+/// `{E6AF56C0-9A53-4678-9CB8-A69ADE6489F1}` -> `GUID`. Braces optional, hex digits only.
+fn parse_guid(text: &str) -> Result<GUID> {
+    let inner = text.trim().trim_start_matches('{').trim_end_matches('}');
+    let groups: Vec<&str> = inner.split('-').collect();
+    let shape_ok = groups.iter().map(|g| g.len()).eq([8, 4, 4, 4, 12])
+        && groups
+            .iter()
+            .all(|g| g.bytes().all(|b| b.is_ascii_hexdigit()));
+    if !shape_ok {
+        bail!("not an interface GUID: {text}");
+    }
+    let value = u128::from_str_radix(&groups.concat(), 16)
+        .with_context(|| format!("not an interface GUID: {text}"))?;
+    Ok(GUID::from_u128(value))
+}
+
+fn doh_key_path(guid: &str, family: Family) -> String {
+    format!(
+        r"SYSTEM\CurrentControlSet\Services\Dnscache\InterfaceSpecificParameters\{}\DohInterfaceSettings\{}",
+        guid,
+        match family {
+            Family::V4 => "Doh",
+            Family::V6 => "Doh6",
+        }
+    )
+}
+
+/// Every per-adapter DoH entry of one family, read from where Windows keeps them.
+///
+/// The registry rather than `GetInterfaceDnsSettings`, because the API only reports entries for
+/// addresses in the adapter's current server list, and an adapter on DHCP has none — while its
+/// entries still exist and come back the moment one of those addresses is configured again.
+pub fn read_doh_entries(guid: &str, family: Family) -> Vec<DohEntry> {
+    let Ok(key) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(doh_key_path(guid, family)) else {
+        return Vec::new();
+    };
+    key.enum_keys()
+        .filter_map(Result::ok)
+        .filter_map(|server| {
+            let flags = key
+                .open_subkey(&server)
+                .and_then(|sub| sub.get_raw_value("DohFlags").map(|v| (sub, v)));
+            // QWORD is what 26100 writes; a DWORD is accepted rather than lost, because an entry
+            // this cannot read is one the switch will replace and the revert will not bring back.
+            let parsed = flags.as_ref().ok().and_then(|(_, v)| match (&v.vtype, v.bytes.len()) {
+                (winreg::enums::RegType::REG_QWORD, 8) => {
+                    Some(u64::from_le_bytes(v.bytes[..8].try_into().ok()?))
+                }
+                (winreg::enums::RegType::REG_DWORD, 4) => {
+                    Some(u32::from_le_bytes(v.bytes[..4].try_into().ok()?) as u64)
+                }
+                _ => None,
+            });
+            match (flags, parsed) {
+                (Ok((sub, _)), Some(flags)) => Some(DohEntry {
+                    template: sub.get_value::<String, _>("DohTemplate").ok(),
+                    server,
+                    flags,
+                }),
+                _ => {
+                    log::warn!(
+                        "unreadable DoH entry {} under {guid} ({family:?}); it will not be in the backup",
+                        server
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// Two spellings of one address are one address: `2A0D:8480:0000:067C::0014` is `2a0d:8480:0:67c::14`.
+pub fn same_address(a: &str, b: &str) -> bool {
+    match (
+        a.trim().parse::<std::net::IpAddr>(),
+        b.trim().parse::<std::net::IpAddr>(),
+    ) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Writes one entry back as Windows stores it: `DohFlags` REG_QWORD, `DohTemplate` REG_SZ.
+pub fn write_doh_entry(guid: &str, family: Family, entry: &DohEntry) -> Result<()> {
+    let path = format!(r"{}\{}", doh_key_path(guid, family), entry.server);
+    let (key, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .create_subkey(&path)
+        .with_context(|| format!("cannot open HKLM\\{path}"))?;
+    key.set_value("DohFlags", &entry.flags)?;
+    match &entry.template {
+        Some(t) => key.set_value("DohTemplate", t)?,
+        None => {
+            let _ = key.delete_value("DohTemplate");
+        }
+    }
+    Ok(())
+}
+
+pub fn delete_doh_entry(guid: &str, family: Family, server: &str) -> Result<()> {
+    let path = format!(r"{}\{}", doh_key_path(guid, family), server);
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .delete_subkey_all(&path)
+        .with_context(|| format!("cannot delete HKLM\\{path}"))
 }
 
 fn netsh(args: &[&str]) -> Result<()> {
@@ -535,5 +783,37 @@ fn oem_to_string(bytes: &[u8]) -> String {
             return String::from_utf8_lossy(bytes).into_owned();
         }
         String::from_utf16_lossy(&wide[..written as usize])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The byte order is the part that fails silently: a GUID with `data4` reversed is a valid
+    /// GUID for no adapter, and `SetInterfaceDnsSettings` reports that as "not found", not "wrong".
+    #[test]
+    fn interface_guid_is_parsed_field_by_field() {
+        let g = parse_guid("{E6AF56C0-9A53-4678-9CB8-A69ADE6489F1}").unwrap();
+        assert_eq!(g.data1, 0xE6AF56C0);
+        assert_eq!(g.data2, 0x9A53);
+        assert_eq!(g.data3, 0x4678);
+        assert_eq!(g.data4, [0x9C, 0xB8, 0xA6, 0x9A, 0xDE, 0x64, 0x89, 0xF1]);
+
+        let bare = parse_guid("e6af56c0-9a53-4678-9cb8-a69ade6489f1").unwrap();
+        assert_eq!((bare.data1, bare.data4), (g.data1, g.data4));
+    }
+
+    #[test]
+    fn anything_but_a_guid_is_refused() {
+        for bad in [
+            "",
+            "{E6AF56C0-9A53-4678-9CB8-A69ADE6489F}",
+            "{E6AF56C09A5346789CB8A69ADE6489F1}",
+            "{+6AF56C0-9A53-4678-9CB8-A69ADE6489F1}",
+            r"{E6AF56C0-9A53-4678-9CB8-A69ADE6489F1}\Doh",
+        ] {
+            assert!(parse_guid(bad).is_err(), "{bad:?} was accepted");
+        }
     }
 }

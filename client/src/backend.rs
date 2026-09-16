@@ -109,7 +109,7 @@ impl Backend {
         if let Backend::Local(local) = self {
             if let Some(rt) = local.rt.take() {
                 rt.block_on(async {
-                    local.app.lock().await.release();
+                    local.app.lock().await.release().await;
                 });
                 rt.shutdown_background();
             }

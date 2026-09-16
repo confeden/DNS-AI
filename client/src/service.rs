@@ -294,7 +294,7 @@ async fn async_main(mut stop_rx: watch::Receiver<bool>) -> Result<()> {
     let _ = pipe_stop_tx.send(true);
     // Restore before the process goes away. This is the whole reason stop is handled at all:
     // a machine whose adapters point at a stub that is not running has no DNS.
-    app.lock().await.on_stop();
+    app.lock().await.on_stop().await;
     pipe_task.abort();
 
     log::info!("service stopped cleanly");
@@ -649,7 +649,10 @@ pub fn probe_report() -> Result<Vec<String>> {
         format!(
             "Резолвер: {} -> {:?}",
             dns_ai_core::config::DOH_URL,
-            dns_ai_core::config::RESOLVER_IPS
+            // What this machine would actually connect to, which is not always what the build
+            // shipped with (`dns_ai_core::endpoints`). A probe that prints the compiled-in pair on
+            // a machine using a newer one is a probe that hides the thing being diagnosed.
+            dns_ai_core::config::resolver_ips_text()
         ),
         String::new(),
     ];
@@ -667,6 +670,21 @@ pub fn probe_report() -> Result<Vec<String>> {
         out.push(format!(
             "      IPv6: {}",
             describe_state(&dns_ai_core::netif::read_dns_state(&a.guid, Family::V6))
+        ));
+        // The adapter's own encryption switch. The template table alone is not it, and the
+        // difference is exactly what Settings shows as «Незашифровано».
+        let doh: Vec<String> = [Family::V4, Family::V6]
+            .into_iter()
+            .flat_map(|f| dns_ai_core::netif::read_doh_entries(&a.guid, f))
+            .map(|e| format!("{} (флаги {})", e.server, e.flags))
+            .collect();
+        out.push(format!(
+            "      DoH на адаптере: {}",
+            if doh.is_empty() {
+                "нет".to_string()
+            } else {
+                doh.join(", ")
+            }
         ));
     }
     if selection.chosen.is_empty() {
@@ -726,7 +744,7 @@ pub fn doh_report(name: &str, qtype_text: &str) -> Result<(Vec<String>, bool)> {
             "Запрос: {name} {qtype_text} -> {}",
             dns_ai_core::config::DOH_URL
         ),
-        format!("Адреса узлов: {:?}", dns_ai_core::config::RESOLVER_IPS),
+        format!("Адреса узлов: {:?}", dns_ai_core::config::resolver_ips_text()),
         String::new(),
     ];
 
@@ -787,6 +805,103 @@ pub fn doh_report(name: &str, qtype_text: &str) -> Result<(Vec<String>, bool)> {
     }
     let ok = summary.rcode == 0;
     Ok((out, ok))
+}
+
+/// Where this machine thinks the resolver is, and where it would look if that stopped being true.
+///
+/// Read-only in the sense that matters — it opens no listener and changes no adapter — but it does
+/// write the cache file if it learns something, because a diagnostic that refuses to keep what it
+/// found would leave the machine worse informed than the check that just ran on it.
+///
+/// `force` is what makes this a test rather than a report: the rescue path is rate-limited to once
+/// every half hour, and a check that silently did nothing would look exactly like a check that
+/// passed.
+pub fn update_report(force: bool) -> Result<Vec<String>> {
+    use dns_ai_core::endpoints;
+
+    let before = endpoints::current();
+    let mut out = vec![
+        format!(
+            "Имя (зашито в программу, по нему проверяется сертификат): {}",
+            dns_ai_core::config::RESOLVER_HOST
+        ),
+        format!(
+            "Адреса из сборки: v4 {:?}, v6 {:?}",
+            dns_ai_core::config::RESOLVER_IPS,
+            dns_ai_core::config::RESOLVER_IPV6
+        ),
+        format!("Кэш: {}", dns_ai_core::paths::endpoints_file().display()),
+        String::new(),
+    ];
+
+    if before.checked_at == 0 {
+        out.push("Ничего ещё не узнавали — в работе адреса из сборки.".into());
+    } else {
+        out.push(format!(
+            "Последний раз узнали из «{}» (serial {}, отметка «{}»):",
+            before.source, before.serial, before.updated
+        ));
+        out.push(format!("  v4: {:?}", before.v4));
+        out.push(format!("  v6: {:?}", before.v6));
+        if !before.retired.is_empty() {
+            out.push(format!("  выведены из работы: {:?}", before.retired));
+        }
+        if !before.notice.is_empty() {
+            out.push(format!("  сообщение: {}", before.notice));
+        }
+    }
+
+    out.push(String::new());
+    out.push("Порядок подключения (сначала свежие, адреса из сборки — всегда в хвосте):".into());
+    for addr in dns_ai_core::config::bootstrap_addrs() {
+        out.push(format!("  {addr}"));
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    out.push(String::new());
+    out.push("Спрашиваем сам резолвер, где он сейчас...".into());
+    let started = Instant::now();
+    let learned = rt.block_on(dns_ai_core::stub::refresh_endpoints(
+        std::time::Duration::from_secs(6),
+    ));
+    let after = endpoints::current();
+    match learned {
+        Some(changed) => out.push(format!(
+            "  ответил за {} мс: v4 {:?}, v6 {:?}{}",
+            started.elapsed().as_millis(),
+            after.v4,
+            after.v6,
+            if changed { " — СПИСОК ИЗМЕНИЛСЯ" } else { "" }
+        )),
+        None => out
+            .push("  не ответил. Это и есть случай, ради которого существует всё остальное.".into()),
+    }
+
+    if force {
+        out.push(String::new());
+        out.push("Проверяем аварийный путь: публичные резолверы, затем опубликованный файл...".into());
+        let started = Instant::now();
+        let changed = rt.block_on(endpoints::rescue_forced());
+        let after = endpoints::current();
+        out.push(format!(
+            "  за {} мс: источник «{}», v4 {:?}{}",
+            started.elapsed().as_millis(),
+            after.source,
+            after.v4,
+            if changed { " — СПИСОК ИЗМЕНИЛСЯ" } else { "" }
+        ));
+        out.push(
+            "  (подробности — в журнале; без сети здесь будет «источник» от прошлого раза)".into(),
+        );
+    } else {
+        out.push(String::new());
+        out.push("Аварийный путь не проверялся: dns-ai test-update --force".into());
+    }
+
+    Ok(out)
 }
 
 #[cfg(test)]

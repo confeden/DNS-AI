@@ -13,12 +13,20 @@ use serde::{Deserialize, Serialize};
 /// egress side, for the same reason.
 pub const RESOLVER_HOST: &str = "dns.dns-ai.ru";
 
-/// The A record of `dns.dns-ai.ru` (ROADMAP S19), pinned. msk3 first, spb1 second; the HTTP
-/// client is given both and picks, so a dead node costs one connect timeout, not resolution.
+/// The A record of `dns.dns-ai.ru` (ROADMAP S19) **as it was on the day this was built**. msk3
+/// first, spb1 second; the HTTP client is given both and picks, so a dead node costs one connect
+/// timeout, not resolution.
 ///
 /// msk2 used to be first here and is gone: its host starves it (ROADMAP S18) and it was removed
 /// from the published record, so a client still pinning it would spend its first connect on a node
 /// nothing else points at.
+///
+/// **This is the floor, not the whole answer.** What the client actually connects to comes from
+/// [`crate::endpoints`], which keeps this list in front of whatever the resolver last said its own
+/// addresses were — because addresses that leave the fleet are *released back to the provider*
+/// (ROADMAP S11/S18) and a build old enough is a build pointing at a stranger. These stay in the
+/// candidate list for ever, at the end of it, so that nothing arriving over the network can leave
+/// a machine with no address to try.
 pub const RESOLVER_IPS: [Ipv4Addr; 2] = [
     Ipv4Addr::new(192, 144, 59, 14),  // msk3
     Ipv4Addr::new(186, 246, 49, 127), // spb1
@@ -56,14 +64,35 @@ pub const ADAPTER_DNS_V6: &str = "::1";
 /// so anything above ~4 s here is only ever seen as a hang.
 pub const UPSTREAM_TIMEOUT_SECS: u64 = 4;
 
-/// The same addresses as text, for the `netsh` calls that configure native mode.
+/// The addresses in use as text, for the `netsh` calls that configure native mode and for the
+/// window. Freshest first: what the resolver last said about itself, or the compiled-in pair when
+/// it has never been asked.
 pub fn resolver_ips_text() -> Vec<String> {
-    RESOLVER_IPS.iter().map(|ip| ip.to_string()).collect()
+    crate::endpoints::effective_v4()
+        .iter()
+        .map(|ip| ip.to_string())
+        .collect()
 }
 
 /// The v6 addresses as text, for the same callers.
 pub fn resolver_ipv6_text() -> Vec<String> {
-    RESOLVER_IPV6.iter().map(|ip| ip.to_string()).collect()
+    crate::endpoints::effective_v6()
+        .iter()
+        .map(|ip| ip.to_string())
+        .collect()
+}
+
+/// Whether `text` is one of the resolver's own addresses, v4 or v6, compared as an address — the
+/// registry and a backup file do not have to spell a v6 address the way this file does.
+///
+/// **Every address that has ever been ours counts**, not just the ones in use now
+/// ([`crate::endpoints::known_addresses`]). This function is what stops the backup from recording
+/// our own address as the user's previous DNS, and a retired address that stops being recognised
+/// is one that gets written into `dns-backup.json` and handed back to the user by «Выключить».
+pub fn is_resolver_address(text: &str) -> bool {
+    text.trim()
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| crate::endpoints::known_addresses().contains(&ip))
 }
 
 /// Where the stub's own DoH client is allowed to connect. IPv4 first, IPv6 **last**.
@@ -77,16 +106,11 @@ pub fn resolver_ipv6_text() -> Vec<String> {
 ///
 /// A host with no IPv6 route at all pays nothing: the connect fails immediately with
 /// "network unreachable" rather than timing out.
+///
+/// The list itself comes from [`crate::endpoints`]: the addresses above, with anything the client
+/// has since learned in front of them.
 pub fn bootstrap_addrs() -> Vec<SocketAddr> {
-    RESOLVER_IPS
-        .iter()
-        .map(|ip| SocketAddr::new(IpAddr::V4(*ip), 443))
-        .chain(
-            RESOLVER_IPV6
-                .iter()
-                .map(|ip| SocketAddr::new(IpAddr::V6(*ip), 443)),
-        )
-        .collect()
+    crate::endpoints::candidates()
 }
 
 /// How the machine is pointed at DNS-AI.

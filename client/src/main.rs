@@ -144,6 +144,17 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        "test-update" => {
+            let force = std::env::args().skip(2).any(|a| a == "--force");
+            // The interesting half of this check is *why* a channel failed, and that is written to
+            // the log rather than returned — a rescue has no caller to report to when it runs for
+            // real. Turning the log on for this one verb is what makes it a diagnostic.
+            dns_ai_core::logging::init(&dns_ai_core::paths::service_log(), true);
+            for line in service::update_report(force)? {
+                println!("{line}");
+            }
+            Ok(())
+        }
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             Ok(())
@@ -297,6 +308,7 @@ DNS-AI — защищённый DNS для Windows
   dns-ai run-console         резолвер в консоли, журнал в stderr
   dns-ai probe               ТОЛЬКО ЧТЕНИЕ: адаптеры и их текущий DNS
   dns-ai test-doh [имя] [тип]  ТОЛЬКО ЧТЕНИЕ: один DoH-запрос к резолверу
+  dns-ai test-update [--force] адреса узлов: что известно, откуда и как обновляется
   dns-ai setup|remove        установка в Program Files — больше не нужна, оставлена
                              для машин, где она уже выполнялась";
 

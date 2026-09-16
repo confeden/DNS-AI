@@ -6,6 +6,8 @@
 //! DNS settings. Diagnosing a broken client after the adapters have been rewritten is much
 //! harder than checking first.
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
 use anyhow::{bail, Result};
 
 pub const TYPE_A: u16 = 1;
@@ -106,6 +108,67 @@ pub fn summarize(msg: &[u8]) -> Result<Summary> {
         answer_count: ancount,
         answers,
     })
+}
+
+/// Every A and AAAA record in the answer section, as addresses rather than as prose.
+///
+/// [`summarize`] formats for a human, and a caller that has to *act* on an answer needs the other
+/// shape. One now does: the client learns where the resolver has moved to from the answer to its
+/// own warm-up query (`crate::endpoints`). Parsing addresses back out of a display function would
+/// break the day somebody improves its wording.
+///
+/// A malformed message yields whatever was read before it went wrong, rather than an error. This
+/// is a hint, not a protocol step — and every address it produces is validated by the caller
+/// before anything is done with it.
+pub fn addresses(msg: &[u8]) -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    if msg.len() < 12 {
+        return out;
+    }
+    // Anything but NOERROR carries no answer worth reading. REFUSED matters in particular: it is
+    // what a query from outside the RU/BY scope comes back as, and it is not an address list.
+    if msg[3] & 0x0F != 0 {
+        return out;
+    }
+    let qdcount = u16::from_be_bytes([msg[4], msg[5]]);
+    let ancount = u16::from_be_bytes([msg[6], msg[7]]);
+
+    let mut i = 12;
+    for _ in 0..qdcount {
+        let Ok(next) = skip_name(msg, i) else {
+            return out;
+        };
+        i = next + 4;
+    }
+    for _ in 0..ancount {
+        let Ok(next) = skip_name(msg, i) else {
+            return out;
+        };
+        i = next;
+        if i + 10 > msg.len() {
+            return out;
+        }
+        let rtype = u16::from_be_bytes([msg[i], msg[i + 1]]);
+        let rdlen = u16::from_be_bytes([msg[i + 8], msg[i + 9]]) as usize;
+        i += 10;
+        let Some(rdata) = msg.get(i..i + rdlen) else {
+            return out;
+        };
+        match (rtype, rdata.len()) {
+            (TYPE_A, 4) => out.push(IpAddr::V4(Ipv4Addr::new(
+                rdata[0], rdata[1], rdata[2], rdata[3],
+            ))),
+            (TYPE_AAAA, 16) => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(rdata);
+                out.push(IpAddr::V6(Ipv6Addr::from(octets)));
+            }
+            // A CNAME chain ends in the A records that follow it, so there is nothing to do here.
+            _ => {}
+        }
+        i += rdlen;
+    }
+    out
 }
 
 fn type_name(t: u16) -> &'static str {
@@ -245,6 +308,74 @@ mod tests {
         assert_eq!(s.rcode, 0);
         assert_eq!(s.answer_count, 1);
         assert!(s.answers[0].contains("93.184.216.34"), "{:?}", s.answers);
+    }
+
+    /// One A and one AAAA behind a CNAME, which is the shape a real answer for a service name
+    /// has, and the shape `endpoints::learn` is handed.
+    #[test]
+    fn addresses_reads_a_and_aaaa_past_a_cname() {
+        let mut m = build_query("dns.dns-ai.ru", TYPE_A, 1).unwrap();
+        m[3] = 0;
+        m[6] = 0;
+        m[7] = 3; // ANCOUNT
+
+        // CNAME, which carries no address and must simply be stepped over.
+        m.extend_from_slice(&[0xC0, 0x0C]);
+        m.extend_from_slice(&TYPE_CNAME.to_be_bytes());
+        m.extend_from_slice(&[0x00, 0x01]);
+        m.extend_from_slice(&60u32.to_be_bytes());
+        m.extend_from_slice(&2u16.to_be_bytes());
+        m.extend_from_slice(&[0xC0, 0x0C]);
+
+        m.extend_from_slice(&[0xC0, 0x0C]);
+        m.extend_from_slice(&TYPE_A.to_be_bytes());
+        m.extend_from_slice(&[0x00, 0x01]);
+        m.extend_from_slice(&60u32.to_be_bytes());
+        m.extend_from_slice(&4u16.to_be_bytes());
+        m.extend_from_slice(&[192, 144, 59, 14]);
+
+        m.extend_from_slice(&[0xC0, 0x0C]);
+        m.extend_from_slice(&TYPE_AAAA.to_be_bytes());
+        m.extend_from_slice(&[0x00, 0x01]);
+        m.extend_from_slice(&60u32.to_be_bytes());
+        m.extend_from_slice(&16u16.to_be_bytes());
+        let v6: Ipv6Addr = "2a0d:8480:0:67c::14".parse().unwrap();
+        m.extend_from_slice(&v6.octets());
+
+        let got = addresses(&m);
+        assert_eq!(
+            got,
+            vec![
+                IpAddr::V4(Ipv4Addr::new(192, 144, 59, 14)),
+                IpAddr::V6(v6)
+            ]
+        );
+    }
+
+    /// REFUSED is what a query from outside the RU/BY scope comes back as. It carries no answer,
+    /// and reading one out of it would be how a client outside the scope "learns" an empty list.
+    #[test]
+    fn addresses_ignores_a_failed_answer() {
+        let mut m = build_query("dns.dns-ai.ru", TYPE_A, 1).unwrap();
+        m[3] = 5; // REFUSED
+        m[7] = 1;
+        assert!(addresses(&m).is_empty());
+        assert!(addresses(&[0u8; 4]).is_empty());
+    }
+
+    /// A record header that claims more data than the message holds must end the walk, not panic.
+    #[test]
+    fn addresses_survives_a_truncated_record() {
+        let mut m = build_query("dns.dns-ai.ru", TYPE_A, 1).unwrap();
+        m[3] = 0;
+        m[7] = 1;
+        m.extend_from_slice(&[0xC0, 0x0C]);
+        m.extend_from_slice(&TYPE_A.to_be_bytes());
+        m.extend_from_slice(&[0x00, 0x01]);
+        m.extend_from_slice(&60u32.to_be_bytes());
+        m.extend_from_slice(&64u16.to_be_bytes()); // claims 64 bytes of rdata
+        m.extend_from_slice(&[192, 144, 59, 14]); // and carries 4
+        assert!(addresses(&m).is_empty());
     }
 
     #[test]

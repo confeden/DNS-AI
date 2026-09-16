@@ -8,6 +8,7 @@
 pub mod backup;
 pub mod config;
 pub mod dnsmsg;
+pub mod endpoints;
 pub mod ipc;
 pub mod logging;
 pub mod netif;

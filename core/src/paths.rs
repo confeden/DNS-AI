@@ -125,6 +125,16 @@ pub fn settings_file() -> PathBuf {
     data_dir().join("settings.json")
 }
 
+/// Where the resolver was last seen, as opposed to where this build was told it would be.
+///
+/// Beside the settings rather than in a hidden place: it is a cache and losing it costs nothing —
+/// the addresses compiled into the executable take over — but a support question about a machine
+/// that cannot resolve is answered by this file, so it should be somewhere a person can find and
+/// delete it (`crate::endpoints`).
+pub fn endpoints_file() -> PathBuf {
+    data_dir().join("endpoints.json")
+}
+
 /// The record of what the machine's DNS looked like before we touched it. One file, rewritten
 /// after every mutating step: what the revert can undo is exactly what reached the disk.
 pub fn backup_file() -> PathBuf {
