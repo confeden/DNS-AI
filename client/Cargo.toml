@@ -8,7 +8,7 @@ description = "DNS-AI for Windows: one executable that is both the LocalSystem s
 
 # One binary, three roles, chosen from argv. See src/main.rs for why the two files became one.
 [[bin]]
-name = "dns-ai"
+name = "DNS-AI"
 path = "src/main.rs"
 
 [dependencies]

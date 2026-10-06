@@ -41,9 +41,11 @@ use winreg::RegKey;
 use crate::shell_link;
 
 /// The folder name under `%ProgramFiles%`, the Start-menu entry and the "Apps & features" row all
-/// carry the product name; only the executable is lower-case, because a command line has to type it.
+/// carry the product name, and since 1.0 so does the executable. Windows paths are case-insensitive,
+/// so an older `dns-ai.exe` in that folder is the same path: an upgrade moves it aside and writes
+/// `DNS-AI.exe` in its place, and the service registration is pointed at the new name.
 const FOLDER: &str = "DNS-AI";
-const EXE: &str = "dns-ai.exe";
+const EXE: &str = "DNS-AI.exe";
 const SHORTCUT: &str = "DNS-AI.lnk";
 
 /// Windows' own list of installed programs. The key name is ours to choose and is never shown; the

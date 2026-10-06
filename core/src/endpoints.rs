@@ -354,24 +354,35 @@ pub fn candidates() -> Vec<SocketAddr> {
 ///
 /// Unlike [`candidates`] this does **not** append the compiled-in list behind a learned one:
 /// Windows tries the servers on an adapter in order and waits on each, so a dead address here is
-/// seconds of every lookup rather than one connect. What we learned replaces what we shipped with,
-/// or — when we have learned nothing — is exactly what we shipped with.
+/// seconds of every lookup rather than one connect. Worse, on a negative answer (NXDOMAIN, or the
+/// NODATA every AAAA of a v4-only site gets) Windows 11 with DoH walks the **whole** list, so every
+/// extra address is one more chance of a ~7.5 s stall (G113). The adapter therefore gets the
+/// compiled-in pair — spb1, then msk3 — for as long as the resolver still lists them, and the rest
+/// of the A record only once neither is in it any more.
 pub fn effective_v4() -> Vec<Ipv4Addr> {
-    let e = current();
-    if e.v4.is_empty() {
-        RESOLVER_IPS.to_vec()
-    } else {
-        e.v4
-    }
+    adapter_list(&current().v4, &RESOLVER_IPS)
 }
 
 /// The v6 addresses, for the same callers and the same reason.
 pub fn effective_v6() -> Vec<Ipv6Addr> {
-    let e = current();
-    if e.v6.is_empty() {
-        RESOLVER_IPV6.to_vec()
+    adapter_list(&current().v6, &RESOLVER_IPV6)
+}
+
+/// The built-in addresses the learned list still contains, in built-in order; the learned list
+/// when it contains none of them; the built-ins when nothing has been learned.
+fn adapter_list<T: Copy + PartialEq>(learned: &[T], built_in: &[T]) -> Vec<T> {
+    if learned.is_empty() {
+        return built_in.to_vec();
+    }
+    let kept: Vec<T> = built_in
+        .iter()
+        .copied()
+        .filter(|ip| learned.contains(ip))
+        .collect();
+    if kept.is_empty() {
+        learned.to_vec()
     } else {
-        e.v6
+        kept
     }
 }
 
@@ -718,6 +729,26 @@ mod tests {
         assert!(e.notice.len() <= 500);
         assert_eq!(e.notice.len() % 2, 0, "clipped between characters");
         assert!(e.notice.chars().all(|c| c == 'я'));
+    }
+
+    #[test]
+    fn the_adapter_gets_the_built_in_pair_while_the_record_lists_it() {
+        let spb1 = ip4("186.246.49.127");
+        let msk3 = ip4("192.144.59.14");
+        let other = ip4("186.246.48.217");
+        let built_in = [spb1, msk3];
+        assert_eq!(adapter_list(&[], &built_in), vec![spb1, msk3]);
+        assert_eq!(
+            adapter_list(&[other, msk3, ip4("94.142.142.155"), spb1], &built_in),
+            vec![spb1, msk3],
+            "only the pair, in its own order, however the record rotates"
+        );
+        assert_eq!(adapter_list(&[other, msk3], &built_in), vec![msk3]);
+        assert_eq!(
+            adapter_list(&[other], &built_in),
+            vec![other],
+            "a fleet that moved on entirely still gets an address"
+        );
     }
 
     /// The property the whole design rests on: whatever arrives from the network, the addresses

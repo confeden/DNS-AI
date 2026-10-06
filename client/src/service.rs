@@ -286,12 +286,16 @@ async fn async_main(mut stop_rx: watch::Receiver<bool>) -> Result<()> {
     app.lock().await.restore_on_start().await;
 
     let (pipe_stop_tx, pipe_stop_rx) = watch::channel(false);
-    let pipe_task = tokio::spawn(pipe::serve(app.clone(), pipe_stop_rx));
+    let pipe_task = tokio::spawn(pipe::serve(app.clone(), pipe_stop_rx.clone()));
+    let guard_task = tokio::spawn(guard(app.clone(), pipe_stop_rx));
 
     let _ = stop_rx.changed().await;
     log::info!("stop requested");
 
     let _ = pipe_stop_tx.send(true);
+    // Waited for, not aborted: a pass may be in the middle of rewriting adapters, and `on_stop`
+    // below must restore after it, not interleaved with it.
+    let _ = guard_task.await;
     // Restore before the process goes away. This is the whole reason stop is handled at all:
     // a machine whose adapters point at a stub that is not running has no DNS.
     app.lock().await.on_stop().await;
@@ -299,6 +303,69 @@ async fn async_main(mut stop_rx: watch::Receiver<bool>) -> Result<()> {
 
     log::info!("service stopped cleanly");
     Ok(())
+}
+
+/// How often the service checks that the adapters still point at us.
+const GUARD_PERIOD: Duration = Duration::from_secs(15);
+/// The longest it waits between attempts while re-applying keeps failing.
+const GUARD_BACKOFF_MAX: Duration = Duration::from_secs(600);
+
+/// How often the service asks whether the resolver is still where the adapters point.
+///
+/// One DoH query to our own resolver, nothing to a third party: the rescue path (public DoH, then
+/// `endpoints.json` on GitHub and its mirror) runs only when that query gets no answer at all, and
+/// is itself held to once per half hour by the stamp in the cache file.
+const WATCH_PERIOD: Duration = Duration::from_secs(600);
+
+/// Keeps protection applied while it is on in the settings ([`App::guard`]), and keeps it pointed
+/// at addresses that answer ([`watch_endpoints`]).
+///
+/// A failed re-apply doubles the wait, up to [`GUARD_BACKOFF_MAX`]: an adapter `netsh` refuses
+/// would otherwise be rewritten — and logged — every 15 seconds for as long as the machine runs.
+async fn guard(app: Arc<Mutex<App>>, mut stop: watch::Receiver<bool>) {
+    let mut wait = GUARD_PERIOD;
+    let mut next_watch = Instant::now() + WATCH_PERIOD;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = stop.changed() => return,
+        }
+        if Instant::now() >= next_watch {
+            watch_endpoints(&app).await;
+            next_watch = Instant::now() + WATCH_PERIOD;
+        }
+        wait = match app.lock().await.guard().await {
+            Some(false) => (wait * 2).min(GUARD_BACKOFF_MAX),
+            _ => GUARD_PERIOD,
+        };
+    }
+}
+
+/// The address watch: is the resolver still reachable where we think it is, and if not, where did
+/// it go?
+///
+/// Stub mode needed this least — its own upstream failures already start the rescue — but native
+/// mode had nothing at all between two enables: Windows does the resolving, so addresses that died
+/// or moved while the machine was up stayed in the adapters until a reboot. Now both modes re-learn
+/// the list from the resolver's own answer every [`WATCH_PERIOD`]; when no known address answers,
+/// the rescue asks public DoH and then the published `endpoints.json` (GitHub first, the site's
+/// mirror second); and native mode then rewrites the adapters if the list changed.
+///
+/// The network part runs without the lock, so the window is never kept waiting on it.
+async fn watch_endpoints(app: &Arc<Mutex<App>>) {
+    if !app.lock().await.is_protecting() {
+        return;
+    }
+    if dns_ai_core::stub::refresh_endpoints(app::REFRESH_BUDGET)
+        .await
+        .is_none()
+    {
+        log::warn!("address watch: no known address answered; asking the outside world");
+        let _ = tokio::time::timeout(app::RESCUE_BUDGET, dns_ai_core::endpoints::rescue()).await;
+    }
+    if app.lock().await.follow_endpoints() == Some(true) {
+        log::info!("address watch: adapters now point at the resolver's current addresses");
+    }
 }
 
 /// Registers the service at this executable's own location and starts it.

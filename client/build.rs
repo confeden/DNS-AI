@@ -59,8 +59,8 @@ fn main() {
     // Where a user goes when something is wrong. `Comments` is the only version-block field
     // Windows shows verbatim in a file's Properties, so both addresses live in it.
     res.set("Comments", "DNS-AI.RU · t.me/nova_txt");
-    res.set("OriginalFilename", "dns-ai.exe");
-    res.set("InternalName", "dns-ai");
+    res.set("OriginalFilename", "DNS-AI.exe");
+    res.set("InternalName", "DNS-AI");
 
     if let Err(e) = res.compile() {
         println!("cargo:warning=the icon and version block were not embedded: {e}");

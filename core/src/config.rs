@@ -28,8 +28,8 @@ pub const RESOLVER_HOST: &str = "dns.dns-ai.ru";
 /// candidate list for ever, at the end of it, so that nothing arriving over the network can leave
 /// a machine with no address to try.
 pub const RESOLVER_IPS: [Ipv4Addr; 2] = [
-    Ipv4Addr::new(192, 144, 59, 14),  // msk3
     Ipv4Addr::new(186, 246, 49, 127), // spb1
+    Ipv4Addr::new(192, 144, 59, 14),  // msk3
 ];
 
 /// The AAAA records of `dns.dns-ai.ru`, pinned for the same reason as the A records above.
@@ -39,8 +39,8 @@ pub const RESOLVER_IPS: [Ipv4Addr; 2] = [
 /// have aimed every query at a single resolver. msk3 has a global v6 address too, so the pair is
 /// as redundant as the v4 pair and both modes can use it.
 pub const RESOLVER_IPV6: [Ipv6Addr; 2] = [
-    Ipv6Addr::new(0x2a0d, 0x8480, 0, 0x067c, 0, 0, 0, 0x14), // msk3
     Ipv6Addr::new(0x2a0a, 0x2b41, 0, 0x500d, 0, 0, 0, 0x53), // spb1
+    Ipv6Addr::new(0x2a0d, 0x8480, 0, 0x067c, 0, 0, 0, 0x14), // msk3
 ];
 
 /// RFC 8484 endpoint. Also what native mode registers as Windows' DoH template.

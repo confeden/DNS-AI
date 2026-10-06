@@ -15,11 +15,11 @@ use dns_ai_core::stub::{self, Stats, StubHandle};
 /// Short on purpose: this is on the path of a button press and of a boot where the network may not
 /// be up yet. Running out of it is not a failure — the list already on disk, and behind it the one
 /// compiled into this build, is what gets written.
-const REFRESH_BUDGET: Duration = Duration::from_millis(2500);
+pub(crate) const REFRESH_BUDGET: Duration = Duration::from_millis(2500);
 
 /// And how long it may then spend asking the outside world where the resolver went, when none of
 /// the addresses it knows about answered at all.
-const RESCUE_BUDGET: Duration = Duration::from_secs(8);
+pub(crate) const RESCUE_BUDGET: Duration = Duration::from_secs(8);
 
 pub struct App {
     settings: Settings,
@@ -27,6 +27,10 @@ pub struct App {
     stats: Arc<Stats>,
     /// Whether the adapters are, as far as this process knows, pointed at us.
     enabled: bool,
+    /// The v4 and v6 lists native mode last wrote into the adapters, so the service can tell when
+    /// the resolver has moved away from them ([`Self::follow_endpoints`]). `None` in stub mode,
+    /// where the adapters hold loopback and the stub follows a move on its own.
+    applied: Option<(Vec<String>, Vec<String>)>,
 }
 
 impl App {
@@ -36,6 +40,7 @@ impl App {
             stub: None,
             stats: Arc::new(Stats::default()),
             enabled: false,
+            applied: None,
         }
     }
 
@@ -153,7 +158,9 @@ impl App {
             Vec::new()
         };
         let (selection, _) = self.back_up()?;
-        self.write_adapters(&selection.chosen, &v4, &v6, false)
+        self.write_adapters(&selection.chosen, &v4, &v6, false)?;
+        self.applied = None;
+        Ok(())
     }
 
     /// Adapters -> the resolver's real addresses, and Windows does the encryption.
@@ -240,7 +247,54 @@ impl App {
 
         // A failure from here on rolls back through `restore_from_backup`, which removes every
         // claimed template along with the adapters' previous state.
-        self.write_adapters(&selection.chosen, &v4, &v6, true)
+        self.write_adapters(&selection.chosen, &v4, &v6, true)?;
+        self.applied = Some((v4, v6));
+        Ok(())
+    }
+
+    /// Whether the service's address watch has anything to look after: protection is on and
+    /// applied in this run.
+    pub fn is_protecting(&self) -> bool {
+        self.settings.enabled && self.enabled
+    }
+
+    /// Native mode: when the addresses the resolver should be reached at no longer match what is in
+    /// the adapters, write the new ones. Called by the service after it has re-checked where the
+    /// resolver is ([`crate::service`]'s address watch), so a node that moves or dies is followed
+    /// within one watch period instead of at the next enable or reboot.
+    ///
+    /// Compared as sets: the authoritative record rotates, and an order change alone is not a move
+    /// (G67). Returns `None` when nothing had to change.
+    pub fn follow_endpoints(&mut self) -> Option<bool> {
+        if !self.is_protecting() || self.settings.mode != Mode::Native {
+            return None;
+        }
+        let v4 = config::resolver_ips_text();
+        let v6 = if self.settings.ipv6 {
+            config::resolver_ipv6_text()
+        } else {
+            Vec::new()
+        };
+        // Nothing written in this run (a window that resumed without the rights to write): no
+        // baseline to compare with, and not ours to rewrite.
+        let (a4, a6) = self.applied.as_ref()?;
+        if same_set(a4, &v4) && same_set(a6, &v6) {
+            return None;
+        }
+        log::info!(
+            "the resolver moved: adapters {} / {} -> {} / {}",
+            a4.join(", "),
+            a6.join(", "),
+            v4.join(", "),
+            v6.join(", ")
+        );
+        match self.enable_native() {
+            Ok(()) => Some(true),
+            Err(e) => {
+                log::error!("could not move the adapters to the new addresses: {e:#}");
+                Some(false)
+            }
+        }
     }
 
     /// The first half both modes share: choose the adapters and get their current state onto the
@@ -330,6 +384,55 @@ impl App {
         Ok(())
     }
 
+    /// One pass of the service's guard: protection is on in the settings, so the adapters should
+    /// point at us. Returns `None` when there was nothing to do, otherwise whether the re-apply
+    /// succeeded.
+    ///
+    /// Something other than us may hand an adapter back to «автоматически»: a network reset, a
+    /// driver update that recreates the adapter, a newly plugged one, another program. Before this
+    /// existed the service only applied the settings at start and on a button press, so such a
+    /// machine silently resolved through the ISP until the next reboot.
+    ///
+    /// Only DHCP counts as drift, never a foreign static list. A static list somebody wrote is a
+    /// decision — a VPN client or the user — and re-writing it every few seconds would be a fight
+    /// with it; DHCP is the state nothing chooses on purpose while protection is on. Only IPv4 is
+    /// looked at: an emptied v6 side (the IPv6 switch off) reads back from the registry exactly
+    /// like DHCP.
+    pub async fn guard(&mut self) -> Option<bool> {
+        if !self.settings.enabled {
+            return None;
+        }
+        if self.enabled {
+            let selection = netif::select_adapters(self.settings.include_vpn_adapters).ok()?;
+            let drifted: Vec<&str> = selection
+                .chosen
+                .iter()
+                .filter(|a| netif::read_dns_state(&a.guid, Family::V4) == DnsState::Dhcp)
+                .map(|a| a.alias.as_str())
+                .collect();
+            if drifted.is_empty() {
+                return None;
+            }
+            log::warn!(
+                "protection is on but DNS is automatic again on: {}; re-applying",
+                drifted.join(", ")
+            );
+        } else {
+            // The start-up enable failed — typically a boot where no adapter had a gateway yet.
+            log::info!("protection is on but was never applied in this run; retrying");
+        }
+        match self.enable().await {
+            Ok(()) => {
+                log::info!("re-applied");
+                Some(true)
+            }
+            Err(e) => {
+                log::error!("could not re-apply: {e:#}");
+                Some(false)
+            }
+        }
+    }
+
     /// The user asked to turn it off: restore, then forget.
     pub async fn disable(&mut self) -> Result<()> {
         let result = restore_from_backup();
@@ -338,6 +441,7 @@ impl App {
         // The stub stops only after the adapters no longer point at it.
         self.stop_stub().await;
         self.enabled = false;
+        self.applied = None;
         self.settings.enabled = false;
         let _ = self.settings.save();
 
@@ -648,6 +752,10 @@ fn claim_templates(backup: &mut DnsBackup, missing: &[String]) -> Vec<String> {
         }
     }
     claimed
+}
+
+fn same_set(a: &[String], b: &[String]) -> bool {
+    a.len() == b.len() && a.iter().all(|x| b.contains(x))
 }
 
 fn describe(state: &DnsState) -> String {
