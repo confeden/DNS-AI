@@ -1,12 +1,12 @@
 #!/bin/sh
 # DNS-AI quick setup for Linux.
-#   curl -fsSL https://raw.githubusercontent.com/confeden/DNS-AI/main/setup.sh | sudo sh
-#   undo: curl -fsSL https://raw.githubusercontent.com/confeden/DNS-AI/main/setup.sh | sudo sh -s -- --undo
+#   curl -fsSL https://dns-ai.ru/setup.sh | sudo sh
+#   undo: curl -fsSL https://dns-ai.ru/setup.sh | sudo sh -s -- --undo
 # systemd-resolved (DNS over TLS) where it exists or can be installed; stubby otherwise.
 # Plain port 53 is not served by DNS-AI, so nothing here ever writes our addresses as plain DNS.
 set -eu
 
-URL=https://raw.githubusercontent.com/confeden/DNS-AI/main/setup.sh
+URL=https://dns-ai.ru/setup.sh
 MANIFESTS="https://raw.githubusercontent.com/confeden/DNS-AI/main/endpoints.json https://dns-ai.ru/endpoints.json"
 TLS_NAME=dns.dns-ai.ru
 BUILTIN_V4="186.246.49.127 192.144.59.14"

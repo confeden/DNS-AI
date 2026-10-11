@@ -1,17 +1,18 @@
 # DNS-AI quick setup for Windows.
-#   irm https://raw.githubusercontent.com/confeden/DNS-AI/main/setup.ps1 | iex
-#   undo: & ([scriptblock]::Create((irm https://raw.githubusercontent.com/confeden/DNS-AI/main/setup.ps1))) -Undo
+#   irm https://dns-ai.ru/setup.ps1 | iex
+#   undo: & ([scriptblock]::Create((irm https://dns-ai.ru/setup.ps1))) -Undo
 # Windows 11: writes the current resolver addresses with native DoH (encrypted only, no fallback).
 # Windows 7/8/10: have no built-in encrypted DNS, so the DNS-AI program is downloaded and installed.
 # Saved WITHOUT a BOM on purpose: `irm | iex` keeps the BOM as a character and fails on line 1.
-# The server must send `charset=utf-8` (raw.githubusercontent.com does) or the Russian text breaks.
+# Served by dns-ai.ru (infra/web/downloads.nginx.conf); the GitHub copy is the inspectable source.
+# The server must send `charset=utf-8` or the Russian text breaks.
 param([switch]$Undo)
 
 function Invoke-DnsAiSetup {
     param([bool]$Undo)
 
     $ErrorActionPreference = 'Stop'
-    $Url       = 'https://raw.githubusercontent.com/confeden/DNS-AI/main/setup.ps1'
+    $Url       = 'https://dns-ai.ru/setup.ps1'
     $Manifests = @('https://raw.githubusercontent.com/confeden/DNS-AI/main/endpoints.json',
                    'https://dns-ai.ru/endpoints.json')
     $Template  = 'https://dns.dns-ai.ru/dns-query'

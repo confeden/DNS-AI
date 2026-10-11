@@ -17,7 +17,7 @@
 **Windows 10 и 11** — в PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/confeden/DNS-AI/main/setup.ps1 | iex
+irm https://dns-ai.ru/setup.ps1 | iex
 ```
 
 * Windows 11 — адреса и встроенный DoH (`https://dns.dns-ai.ru/dns-query`, без возврата к открытому
@@ -25,16 +25,16 @@ irm https://raw.githubusercontent.com/confeden/DNS-AI/main/setup.ps1 | iex
 * Windows 7, 8 и 10 — встроенного шифрованного DNS у них нет, поэтому скачивается и ставится
   программа `DNS-AI.exe` из последнего релиза.
 
-Отмена: `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/confeden/DNS-AI/main/setup.ps1))) -Undo`
+Отмена: `& ([scriptblock]::Create((irm https://dns-ai.ru/setup.ps1))) -Undo`
 
 **Linux** (Debian, Ubuntu, Fedora, RHEL, openSUSE, Arch, Alpine, Void…):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/confeden/DNS-AI/main/setup.sh | sudo sh
+curl -fsSL https://dns-ai.ru/setup.sh | sudo sh
 ```
 
 Где есть systemd 247+ — DNS-over-TLS через `systemd-resolved` (ставится, если его нет); иначе —
-`stubby`. Отмена: `curl -fsSL https://raw.githubusercontent.com/confeden/DNS-AI/main/setup.sh | sudo sh -s -- --undo`
+`stubby`. Отмена: `curl -fsSL https://dns-ai.ru/setup.sh | sudo sh -s -- --undo`
 
 **iPhone, iPad, Mac** — профиль: <https://dns-ai.ru/dns-ai.mobileconfig> (открыть в Safari).
 
