@@ -25,7 +25,7 @@ irm https://dns-ai.ru/setup.ps1 | iex
 * Windows 7, 8 и 10 — встроенного шифрованного DNS у них нет, поэтому скачивается и ставится
   программа `DNS-AI.exe` из последнего релиза.
 
-Отмена: `& ([scriptblock]::Create((irm https://dns-ai.ru/setup.ps1))) -Undo`
+Отмена: `irm https://dns-ai.ru/undo.ps1 | iex`
 
 **Linux** (Debian, Ubuntu, Fedora, RHEL, openSUSE, Arch, Alpine, Void…):
 
@@ -34,7 +34,7 @@ curl -fsSL https://dns-ai.ru/setup.sh | sudo sh
 ```
 
 Где есть systemd 247+ — DNS-over-TLS через `systemd-resolved` (ставится, если его нет); иначе —
-`stubby`. Отмена: `curl -fsSL https://dns-ai.ru/setup.sh | sudo sh -s -- --undo`
+`stubby`. Отмена: `curl -fsSL https://dns-ai.ru/undo.sh | sudo sh`
 
 **iPhone, iPad, Mac** — профиль: <https://dns-ai.ru/dns-ai.mobileconfig> (открыть в Safari).
 

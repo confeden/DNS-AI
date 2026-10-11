@@ -1,7 +1,7 @@
 #!/bin/sh
 # DNS-AI quick setup for Linux.
 #   curl -fsSL https://dns-ai.ru/setup.sh | sudo sh
-#   undo: curl -fsSL https://dns-ai.ru/setup.sh | sudo sh -s -- --undo
+#   undo: curl -fsSL https://dns-ai.ru/undo.sh | sudo sh   (wrapper that runs this file with --undo)
 # systemd-resolved (DNS over TLS) where it exists or can be installed; stubby otherwise.
 # Plain port 53 is not served by DNS-AI, so nothing here ever writes our addresses as plain DNS.
 set -eu
@@ -196,7 +196,7 @@ verify() {
         fi
     else
         warn "имя dns-ai.ru не разрешилось за 10 секунд"
-        say "Отменить: curl -fsSL $URL | sudo sh -s -- --undo"
+        say "Отменить: curl -fsSL https://dns-ai.ru/undo.sh | sudo sh"
         exit 1
     fi
 }

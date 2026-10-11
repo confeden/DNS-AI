@@ -1,6 +1,6 @@
 # DNS-AI quick setup for Windows.
 #   irm https://dns-ai.ru/setup.ps1 | iex
-#   undo: & ([scriptblock]::Create((irm https://dns-ai.ru/setup.ps1))) -Undo
+#   undo: irm https://dns-ai.ru/undo.ps1 | iex   (wrapper that runs this file with -Undo)
 # Windows 11: writes the current resolver addresses with native DoH (encrypted only, no fallback).
 # Windows 7/8/10: have no built-in encrypted DNS, so the DNS-AI program is downloaded and installed.
 # Saved WITHOUT a BOM on purpose: `irm | iex` keeps the BOM as a character and fails on line 1.
@@ -175,7 +175,7 @@ function Invoke-DnsAiSetup {
     Write-Host ''
     Write-Host 'Готово. В «Параметры → Сеть и Интернет» рядом с адресами должно стоять «Зашифровано».' -ForegroundColor Green
     Write-Host 'Проверка: https://dns-ai.ru/ip'
-    Write-Host ("Отменить:  & ([scriptblock]::Create((irm {0}))) -Undo" -f $Url)
+    Write-Host 'Отменить:  irm https://dns-ai.ru/undo.ps1 | iex'
 }
 
 Invoke-DnsAiSetup -Undo:([bool]$Undo -or $env:DNSAI_UNDO -eq '1')
