@@ -9,8 +9,8 @@ set -eu
 URL=https://dns-ai.ru/setup.sh
 MANIFESTS="https://raw.githubusercontent.com/confeden/DNS-AI/main/endpoints.json https://dns-ai.ru/endpoints.json"
 TLS_NAME=dns.dns-ai.ru
-BUILTIN_V4="186.246.49.127 192.144.59.14"
-BUILTIN_V6="2a0a:2b41:0:500d::53 2a0d:8480:0:67c::14"
+BUILTIN_V4="186.246.49.127 194.87.196.13"
+BUILTIN_V6="2a0a:2b41:0:500d::53 2a00:b700:5::3:62"
 STATE=/etc/dns-ai
 RESOLVED_DROPIN=/etc/systemd/resolved.conf.d/dns-ai.conf
 

@@ -17,8 +17,8 @@ function Invoke-DnsAiSetup {
                    'https://dns-ai.ru/endpoints.json')
     $Template  = 'https://dns.dns-ai.ru/dns-query'
     $ExeUrl    = 'https://github.com/confeden/DNS-AI/releases/latest/download/DNS-AI.exe'
-    $BuiltinV4 = @('186.246.49.127', '192.144.59.14')
-    $BuiltinV6 = @('2a0a:2b41:0:500d::53', '2a0d:8480:0:67c::14')
+    $BuiltinV4 = @('186.246.49.127', '194.87.196.13')
+    $BuiltinV6 = @('2a0a:2b41:0:500d::53', '2a00:b700:5::3:62')
     $DohKey    = 'HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\InterfaceSpecificParameters'
     $SkipName  = 'Hyper-V|VMware|VirtualBox|WSL|vEthernet|TAP|WireGuard|Wintun|Tailscale|ZeroTier|Amnezia|OpenVPN|Loopback|Virtual'
 
