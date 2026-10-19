@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "dns-ai-client"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "dns-ai-core",
@@ -507,7 +507,7 @@ dependencies = [
 
 [[package]]
 name = "dns-ai-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "log",

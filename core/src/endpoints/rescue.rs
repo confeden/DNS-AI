@@ -87,6 +87,49 @@ pub async fn rescue_forced() -> bool {
     search(true).await
 }
 
+/// Liveness probe for the addresses the adapters use (and those already suspected): a TCP connect to
+/// :443 each. A family (v4 or v6) is judged only if at least one of its addresses answered, so a
+/// machine that is offline, or has no v6 route, marks nothing. Updates the in-memory suspect set that
+/// `effective_v4/v6` steers around and returns whether any address is suspected now.
+pub async fn probe_addresses() -> bool {
+    async fn alive(ip: IpAddr) -> bool {
+        let addr = SocketAddr::new(ip, DOH_PORT);
+        matches!(
+            tokio::time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(addr)).await,
+            Ok(Ok(_))
+        )
+    }
+    let mut v4: Vec<IpAddr> = super::effective_v4().into_iter().map(IpAddr::V4).collect();
+    let mut v6: Vec<IpAddr> = super::effective_v6().into_iter().map(IpAddr::V6).collect();
+    for ip in super::suspects() {
+        let list = if ip.is_ipv4() { &mut v4 } else { &mut v6 };
+        if !list.contains(&ip) {
+            list.push(ip);
+        }
+    }
+    let mut bad: Vec<IpAddr> = Vec::new();
+    for family in [v4, v6] {
+        let mut up = 0;
+        let mut down = Vec::new();
+        for ip in family {
+            if alive(ip).await {
+                up += 1;
+            } else {
+                down.push(ip);
+            }
+        }
+        if up > 0 {
+            bad.extend(down);
+        }
+    }
+    if !bad.is_empty() {
+        log::warn!("address watch: not answering on 443: {bad:?}");
+    }
+    let any = !bad.is_empty();
+    super::set_suspects(bad);
+    any
+}
+
 async fn search(probe_all: bool) -> bool {
     // Whether anything out there answered at all, which is a different question from whether the
     // answer was useful — see `relax_cooldown`.

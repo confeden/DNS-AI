@@ -54,7 +54,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{RESOLVER_IPS, RESOLVER_IPV6};
+use crate::config::{LEGACY_IPS, LEGACY_IPV6, RESOLVER_IPS, RESOLVER_IPV6};
 
 /// Every transport a node speaks runs on 443; the manifest does not get to choose a port, because
 /// a port is one more thing arriving from the network for no benefit anyone has asked for.
@@ -350,40 +350,95 @@ pub fn candidates() -> Vec<SocketAddr> {
         .collect()
 }
 
+/// How many servers go into one adapter. Windows tries them in order and waits on each, and on a
+/// negative answer with DoH it walks the **whole** list (G113), so two is the redundancy that is
+/// worth its stall.
+const ADAPTER_SLOTS: usize = 2;
+
+/// Addresses that stopped answering on :443 while the network was otherwise up. In memory only: it
+/// steers the next adapter write away from a node that is dying but is still listed in the A record
+/// and not yet in `retired`.
+static SUSPECT: OnceLock<Mutex<Vec<IpAddr>>> = OnceLock::new();
+
+fn suspects() -> Vec<IpAddr> {
+    match SUSPECT.get_or_init(|| Mutex::new(Vec::new())).lock() {
+        Ok(g) => g.clone(),
+        Err(p) => p.into_inner().clone(),
+    }
+}
+
+/// Replace the suspect set (the service's liveness probe calls this every watch period).
+pub fn set_suspects(list: Vec<IpAddr>) {
+    let m = SUSPECT.get_or_init(|| Mutex::new(Vec::new()));
+    match m.lock() {
+        Ok(mut g) => *g = list,
+        Err(p) => *p.into_inner() = list,
+    }
+}
+
 /// The v4 addresses to write into an adapter in native mode, and to show in the window.
 ///
-/// Unlike [`candidates`] this does **not** append the compiled-in list behind a learned one:
-/// Windows tries the servers on an adapter in order and waits on each, so a dead address here is
-/// seconds of every lookup rather than one connect. Worse, on a negative answer (NXDOMAIN, or the
-/// NODATA every AAAA of a v4-only site gets) Windows 11 with DoH walks the **whole** list, so every
-/// extra address is one more chance of a ~7.5 s stall (G113). The adapter therefore gets the
-/// compiled-in pair — spb1, then msk3 — for as long as the resolver still lists them, and the rest
-/// of the A record only once neither is in it any more.
+/// Unlike [`candidates`] this does **not** append the compiled-in list behind a learned one (see
+/// [`ADAPTER_SLOTS`]). It picks at most two live ones: compiled-in addresses the resolver still
+/// lists first (stable under record rotation), then the rest of what was learned; never a retired
+/// or currently unreachable one while any other exists.
 pub fn effective_v4() -> Vec<Ipv4Addr> {
-    adapter_list(&current().v4, &RESOLVER_IPS)
+    let e = current();
+    let sus = suspects();
+    adapter_list(&e.v4, &RESOLVER_IPS, |ip| {
+        let ip = IpAddr::V4(*ip);
+        e.retired.contains(&ip) || sus.contains(&ip)
+    })
 }
 
 /// The v6 addresses, for the same callers and the same reason.
 pub fn effective_v6() -> Vec<Ipv6Addr> {
-    adapter_list(&current().v6, &RESOLVER_IPV6)
+    let e = current();
+    let sus = suspects();
+    adapter_list(&e.v6, &RESOLVER_IPV6, |ip| {
+        let ip = IpAddr::V6(*ip);
+        e.retired.contains(&ip) || sus.contains(&ip)
+    })
 }
 
-/// The built-in addresses the learned list still contains, in built-in order; the learned list
-/// when it contains none of them; the built-ins when nothing has been learned.
-fn adapter_list<T: Copy + PartialEq>(learned: &[T], built_in: &[T]) -> Vec<T> {
-    if learned.is_empty() {
-        return built_in.to_vec();
+/// Pick up to [`ADAPTER_SLOTS`] addresses. Pool = learned (the built-ins when nothing was learned);
+/// built-ins first in their own order, then the remainder in a fixed order so that a rotating A
+/// record never looks like a move. `bad` addresses are skipped; if that would leave nothing, the
+/// pool is used as it is (an unreachable resolver beats no resolver), and then the built-ins.
+fn adapter_list<T: Copy + PartialEq + Ord>(
+    learned: &[T],
+    built_in: &[T],
+    bad: impl Fn(&T) -> bool,
+) -> Vec<T> {
+    let pool: &[T] = if learned.is_empty() { built_in } else { learned };
+    let order = |list: &[T], skip_bad: bool| -> Vec<T> {
+        let mut out: Vec<T> = built_in
+            .iter()
+            .copied()
+            .filter(|ip| list.contains(ip))
+            .collect();
+        let mut rest: Vec<T> = list
+            .iter()
+            .copied()
+            .filter(|ip| !built_in.contains(ip))
+            .collect();
+        rest.sort();
+        out.extend(rest);
+        if skip_bad {
+            out.retain(|ip| !bad(ip));
+        }
+        out.truncate(ADAPTER_SLOTS);
+        out
+    };
+    let good = order(pool, true);
+    if !good.is_empty() {
+        return good;
     }
-    let kept: Vec<T> = built_in
-        .iter()
-        .copied()
-        .filter(|ip| learned.contains(ip))
-        .collect();
-    if kept.is_empty() {
-        learned.to_vec()
-    } else {
-        kept
+    let fallback = order(built_in, true);
+    if !fallback.is_empty() {
+        return fallback;
     }
+    order(pool, false)
 }
 
 /// Every address that has ever been ours, as far as this machine knows.
@@ -401,6 +456,12 @@ pub fn known_addresses() -> Vec<IpAddr> {
         push_unique(&mut all, IpAddr::V4(ip));
     }
     for ip in RESOLVER_IPV6 {
+        push_unique(&mut all, IpAddr::V6(ip));
+    }
+    for ip in LEGACY_IPS {
+        push_unique(&mut all, IpAddr::V4(ip));
+    }
+    for ip in LEGACY_IPV6 {
         push_unique(&mut all, IpAddr::V6(ip));
     }
     for ip in e.v4 {
@@ -624,7 +685,7 @@ fn relax_cooldown() {
 #[cfg(feature = "stub")]
 mod rescue;
 #[cfg(feature = "stub")]
-pub use rescue::{rescue, rescue_forced};
+pub use rescue::{probe_addresses, rescue, rescue_forced};
 
 #[cfg(test)]
 mod tests {
@@ -732,23 +793,30 @@ mod tests {
     }
 
     #[test]
-    fn the_adapter_gets_the_built_in_pair_while_the_record_lists_it() {
-        let spb1 = ip4("186.246.49.127");
-        let msk3 = ip4("192.144.59.14");
-        let other = ip4("186.246.48.217");
-        let built_in = [spb1, msk3];
-        assert_eq!(adapter_list(&[], &built_in), vec![spb1, msk3]);
+    fn the_adapter_gets_two_live_addresses() {
+        let spb7 = ip4("194.87.196.13");
+        let msk7 = ip4("45.151.102.219");
+        let old = ip4("186.246.49.127");
+        let other = ip4("203.0.113.9");
+        let built_in = [spb7, msk7];
+        let none = |_: &Ipv4Addr| false;
+        assert_eq!(adapter_list(&[], &built_in, none), vec![spb7, msk7]);
         assert_eq!(
-            adapter_list(&[other, msk3, ip4("94.142.142.155"), spb1], &built_in),
-            vec![spb1, msk3],
-            "only the pair, in its own order, however the record rotates"
+            adapter_list(&[old, msk7, other, spb7], &built_in, none),
+            vec![spb7, msk7],
+            "built-ins first, in their own order, however the record rotates"
         );
-        assert_eq!(adapter_list(&[other, msk3], &built_in), vec![msk3]);
+        let retired = |ip: &Ipv4Addr| *ip == old;
+        assert_eq!(adapter_list(&[old, other], &built_in, retired), vec![other]);
+        // A built-in that dies is replaced by the next live address in the record.
+        let dead = |ip: &Ipv4Addr| *ip == msk7;
         assert_eq!(
-            adapter_list(&[other], &built_in),
-            vec![other],
-            "a fleet that moved on entirely still gets an address"
+            adapter_list(&[spb7, msk7, other], &built_in, dead),
+            vec![spb7, other]
         );
+        // Everything bad: still an address.
+        let all = |_: &Ipv4Addr| true;
+        assert!(!adapter_list(&[old], &built_in, all).is_empty());
     }
 
     /// The property the whole design rests on: whatever arrives from the network, the addresses

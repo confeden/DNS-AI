@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 /// egress side, for the same reason.
 pub const RESOLVER_HOST: &str = "dns.dns-ai.ru";
 
-/// The A record of `dns.dns-ai.ru` (ROADMAP S19) **as it was on the day this was built**. msk3
-/// first, spb1 second; the HTTP client is given both and picks, so a dead node costs one connect
+/// The A record of `dns.dns-ai.ru` **as it was on the day this was built** (v1.1: spb7, msk7). The
+/// HTTP client is given both and picks, so a dead node costs one connect
 /// timeout, not resolution.
 ///
 /// msk2 used to be first here and is gone: its host starves it (ROADMAP S18) and it was removed
@@ -28,19 +28,29 @@ pub const RESOLVER_HOST: &str = "dns.dns-ai.ru";
 /// candidate list for ever, at the end of it, so that nothing arriving over the network can leave
 /// a machine with no address to try.
 pub const RESOLVER_IPS: [Ipv4Addr; 2] = [
-    Ipv4Addr::new(186, 246, 49, 127), // spb1
-    Ipv4Addr::new(192, 144, 59, 14),  // msk3
+    Ipv4Addr::new(194, 87, 196, 13), // spb7
+    Ipv4Addr::new(45, 151, 102, 219), // msk7
 ];
 
 /// The AAAA records of `dns.dns-ai.ru`, pinned for the same reason as the A records above.
 ///
-/// **Two nodes now, not one.** This used to be a single spb1 address, which is why native mode
-/// cleared IPv6 instead of configuring it: handing Windows one v6 server it prefers over v4 would
-/// have aimed every query at a single resolver. msk3 has a global v6 address too, so the pair is
-/// as redundant as the v4 pair and both modes can use it.
+/// Two nodes, as the v4 pair, so both modes can configure v6 without aiming every query at one
+/// resolver.
 pub const RESOLVER_IPV6: [Ipv6Addr; 2] = [
-    Ipv6Addr::new(0x2a0a, 0x2b41, 0, 0x500d, 0, 0, 0, 0x53), // spb1
-    Ipv6Addr::new(0x2a0d, 0x8480, 0, 0x067c, 0, 0, 0, 0x14), // msk3
+    Ipv6Addr::new(0x2a00, 0xb700, 5, 0, 0, 0, 3, 0x62),           // spb7
+    Ipv6Addr::new(0x2a12, 0x5940, 0xd4ef, 0, 0, 0, 0, 0x219),     // msk7
+];
+
+/// Addresses that were compiled in by earlier builds (v0.9–v1.0: spb1 and msk3). They are no longer
+/// connected to, but must stay recognised as ours: an adapter still carrying one is ours, not the
+/// user's previous DNS (`endpoints::known_addresses`).
+pub const LEGACY_IPS: [Ipv4Addr; 2] = [
+    Ipv4Addr::new(186, 246, 49, 127),
+    Ipv4Addr::new(192, 144, 59, 14),
+];
+pub const LEGACY_IPV6: [Ipv6Addr; 2] = [
+    Ipv6Addr::new(0x2a0a, 0x2b41, 0, 0x500d, 0, 0, 0, 0x53),
+    Ipv6Addr::new(0x2a0d, 0x8480, 0, 0x067c, 0, 0, 0, 0x14),
 ];
 
 /// RFC 8484 endpoint. Also what native mode registers as Windows' DoH template.

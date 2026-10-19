@@ -363,6 +363,11 @@ async fn watch_endpoints(app: &Arc<Mutex<App>>) {
         log::warn!("address watch: no known address answered; asking the outside world");
         let _ = tokio::time::timeout(app::RESCUE_BUDGET, dns_ai_core::endpoints::rescue()).await;
     }
+    // One of the addresses in the adapters is dead while the rest of the network works: take it out
+    // of the list (published `retired` first, if the file says so) and write a live replacement.
+    if dns_ai_core::endpoints::probe_addresses().await {
+        let _ = tokio::time::timeout(app::RESCUE_BUDGET, dns_ai_core::endpoints::rescue()).await;
+    }
     if app.lock().await.follow_endpoints() == Some(true) {
         log::info!("address watch: adapters now point at the resolver's current addresses");
     }
