@@ -17,8 +17,8 @@ function Invoke-DnsAiSetup {
                    'https://dns-ai.ru/endpoints.json')
     $Template  = 'https://dns.dns-ai.ru/dns-query'
     $ExeUrl    = 'https://github.com/confeden/DNS-AI/releases/latest/download/DNS-AI.exe'
-    $BuiltinV4 = @('186.246.49.127', '194.87.196.13')
-    $BuiltinV6 = @('2a0a:2b41:0:500d::53', '2a00:b700:5::3:62')
+    $BuiltinV4 = @('194.87.196.13', '45.151.102.219')
+    $BuiltinV6 = @('2a00:b700:5::3:62', '2a12:5940:d4ef::219')
     $DohKey    = 'HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\InterfaceSpecificParameters'
     $SkipName  = 'Hyper-V|VMware|VirtualBox|WSL|vEthernet|TAP|WireGuard|Wintun|Tailscale|ZeroTier|Amnezia|OpenVPN|Loopback|Virtual'
 
@@ -93,7 +93,8 @@ function Invoke-DnsAiSetup {
     }
 
     # --- Windows 11: native DoH
-    $ours = @($v4 + $v6 + $BuiltinV4 + $BuiltinV6 + $retired | Where-Object { $_ } | Select-Object -Unique)
+    $legacy = @('186.246.49.127','192.144.59.14','2a0a:2b41:0:500d::53','2a0d:8480:0:67c::14')  # v1.0 and older: still ours for undo
+    $ours = @($v4 + $v6 + $BuiltinV4 + $BuiltinV6 + $legacy + $retired | Where-Object { $_ } | Select-Object -Unique)
     $adapters = @(Get-NetAdapter | Where-Object {
         $_.Status -eq 'Up' -and -not $_.Virtual -and
         $_.Name -notmatch $SkipName -and $_.InterfaceDescription -notmatch $SkipName })
